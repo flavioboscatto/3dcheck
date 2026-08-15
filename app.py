@@ -489,7 +489,7 @@ def limpar_tudo():
                 pass
 
     st.session_state.reset_key += 1
-    prefixos_para_limpar = ('cache_', 'raster_path_', 'raster_id_', 'raster_mde_path_', 'raster_mde_id_', 'zoom_mapa_', 'imagem_recortada_', 'extensao_raster_', 'marcacoes_', 'select_ponto_', 'pendente_nav_', 'ultimo_clique_', 'modo_coleta_')
+    prefixos_para_limpar = ('cache_', 'raster_path_', 'raster_id_', 'raster_mde_path_', 'raster_mde_id_', 'vista_ponto_', 'imagem_recortada_', 'extensao_raster_', 'marcacoes_', 'select_ponto_', 'pendente_nav_', 'ultimo_clique_', 'modo_coleta_')
     for key in list(st.session_state.keys()):
         if key.startswith(prefixos_para_limpar):
             del st.session_state[key]
@@ -1111,7 +1111,7 @@ if condicao_passo5:
             # --- Grava a ortofoto em disco (nunca em memória: arquivos podem ter vários GB) ---
             chave_raster_path = f"raster_path_{st.session_state.reset_key}"
             chave_raster_id = f"raster_id_{st.session_state.reset_key}"
-            chave_zoom_mapa = f"zoom_mapa_{st.session_state.reset_key}"
+            chave_vista_ponto = f"vista_ponto_{st.session_state.reset_key}"
             chave_imagem_recortada = f"imagem_recortada_{st.session_state.reset_key}"
             chave_extensao_raster = f"extensao_raster_{st.session_state.reset_key}"
             identificador_raster = f"{uploaded_tiff.name}_{uploaded_tiff.size}"
@@ -1142,8 +1142,8 @@ if condicao_passo5:
 
                 st.session_state[chave_raster_path] = caminho_raster
                 st.session_state[chave_raster_id] = identificador_raster
-                # Nova ortofoto: descarta zoom/imagem/extensão da ortofoto anterior.
-                st.session_state.pop(chave_zoom_mapa, None)
+                # Nova ortofoto: descarta vista/imagem/extensão da ortofoto anterior.
+                st.session_state.pop(chave_vista_ponto, None)
                 st.session_state.pop(chave_imagem_recortada, None)
                 st.session_state.pop(chave_extensao_raster, None)
 
@@ -1279,29 +1279,42 @@ if condicao_passo5:
                 else:
                     lon_centro, lat_centro = lon_nominal, lat_nominal
 
-                # O nível de ZOOM (não a posição) é persistido em session_state e
-                # reaplicado a cada rerun em vez de um zoom_start fixo — resolve o
-                # reset de zoom ao marcar um ponto, sem impedir que a navegação
-                # entre pontos continue levando o mapa até cada um.
-                zoom_persistido = st.session_state.get(chave_zoom_mapa, 19)
+                # A posição/zoom do mapa (bounds) só é reaproveitada exatamente como
+                # estava enquanto o usuário continuar no MESMO ponto — qualquer rerun
+                # nessa condição (marcar checkbox, clicar em Coletar Ponto, um
+                # zoom/pan que dispara sincronização do componente, etc.) reproduz o
+                # bounds exato relatado pela última interação, sem "puxar" a vista de
+                # volta para o centro do ponto. Isso é o que evita o zoom "voltando"
+                # sozinho: como o bounds restaurado é idêntico ao que o Leaflet já
+                # tinha, o remonte do mapa (inevitável a cada rerun do Streamlit) fica
+                # visualmente estável, permitindo aproximar livremente. Só ao MUDAR de
+                # ponto (navegação Anterior/Próximo/avanço automático) a vista é
+                # recalculada, centralizada no novo ponto.
+                vista_salva = st.session_state.get(chave_vista_ponto)
+                ZOOM_PADRAO_MAPA = 19
+                if vista_salva and vista_salva.get("ponto") == ponto_escolhido:
+                    sul, oeste, norte, leste = vista_salva["bounds"]
+                else:
+                    sul, oeste, norte, leste = calcula_bounds_por_zoom(lat_centro, lon_centro, ZOOM_PADRAO_MAPA)
 
                 mapa = folium.Map(
-                    location=[lat_centro, lon_centro],
-                    zoom_start=zoom_persistido,
+                    location=[(sul + norte) / 2, (oeste + leste) / 2],
+                    zoom_start=ZOOM_PADRAO_MAPA,
                     max_zoom=23,
                     tiles=None,
                     control_scale=True
                 )
+                mapa.fit_bounds([[sul, oeste], [norte, leste]])
 
                 atualizar_vista_clicado = st.button(
                     "🔄 Atualizar Vista",
-                    help="Recorta a ortofoto novamente ao redor do ponto atual, na área/zoom em que o mapa está agora. Use se você navegou (pan/zoom) para longe do ponto e quer uma imagem mais nítida."
+                    help="Recorta a ortofoto novamente para a área/zoom em que o mapa está agora. Use depois de aproximar bastante o zoom, para uma imagem mais nítida."
                 )
 
                 # A imagem recortada é regerada automaticamente sempre que o ponto
                 # atual muda (para o mapa já aparecer com a área certa ao navegar)
-                # ou quando o usuário clica em "Atualizar Vista" — nunca a cada
-                # pequeno pan/zoom manual, para manter previsível o custo de
+                # ou quando o usuário clica em "Atualizar Vista" — nunca sozinha a
+                # cada pequeno pan/zoom, para manter previsível o custo de
                 # processamento em rasters de vários GB.
                 imagem_cache = st.session_state.get(chave_imagem_recortada)
                 precisa_recortar = (
@@ -1313,8 +1326,7 @@ if condicao_passo5:
                 if precisa_recortar:
                     with st.spinner("Recortando a ortofoto ao redor do ponto atual..."):
                         try:
-                            bounds_recorte = calcula_bounds_por_zoom(lat_centro, lon_centro, zoom_persistido)
-                            imagem_uri, bounds_img = gera_overlay_ortofoto(caminho_raster, bounds_recorte, max_dim=1800)
+                            imagem_uri, bounds_img = gera_overlay_ortofoto(caminho_raster, (sul, oeste, norte, leste), max_dim=1800)
                             imagem_cache = {
                                 "raster_id": identificador_raster,
                                 "ponto": ponto_escolhido,
@@ -1383,13 +1395,19 @@ if condicao_passo5:
                     width=1100,
                     height=550,
                     key=f"mapa_ortofoto_{st.session_state.reset_key}_{ponto_escolhido}",
-                    returned_objects=["last_clicked", "zoom"]
+                    returned_objects=["last_clicked", "bounds"]
                 )
 
                 if resultado_mapa:
-                    zoom_retornado = resultado_mapa.get("zoom")
-                    if zoom_retornado is not None:
-                        st.session_state[chave_zoom_mapa] = zoom_retornado
+                    bounds_retornado = resultado_mapa.get("bounds")
+                    if bounds_retornado:
+                        sudoeste = bounds_retornado.get("_southWest") or {}
+                        nordeste = bounds_retornado.get("_northEast") or {}
+                        if all(k in sudoeste for k in ("lat", "lng")) and all(k in nordeste for k in ("lat", "lng")):
+                            st.session_state[chave_vista_ponto] = {
+                                "ponto": ponto_escolhido,
+                                "bounds": (sudoeste["lat"], sudoeste["lng"], nordeste["lat"], nordeste["lng"]),
+                            }
 
                     if modo_coleta and resultado_mapa.get("last_clicked"):
                         lat_clique = resultado_mapa["last_clicked"]["lat"]
