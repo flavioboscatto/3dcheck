@@ -4,11 +4,17 @@ import geopandas as gpd
 from shapely.geometry import Point
 import rasterio
 from rasterio.io import MemoryFile
+from rasterio.enums import Resampling
+from rasterio.windows import from_bounds as window_from_bounds, bounds as window_bounds
+import numpy as np
+from PIL import Image
 import json
 import unicodedata
 import tempfile
 import os
 import re
+import io
+import base64
 import math
 from fpdf import FPDF
 
@@ -18,7 +24,6 @@ from fpdf import FPDF
 try:
     import folium
     from streamlit_folium import st_folium
-    from localtileserver import TileClient, get_folium_tile_layer
     from pyproj import Transformer
     LIBS_ORTOFOTO_OK = True
     ERRO_LIBS_ORTOFOTO = None
@@ -165,6 +170,78 @@ def limpa_coords_numericas(df, col_x, col_y, col_z=None):
         colunas_checar.append(col_z)
 
     return df_limpo.dropna(subset=colunas_checar)
+
+def gera_overlay_ortofoto(caminho_raster, bounds_wgs84, max_dim=1800):
+    """Lê, sob demanda, apenas a janela do raster correspondente à área
+    visível do mapa (leitura em janela do rasterio — nunca o arquivo
+    inteiro, mesmo em ortofotos de vários GB) e devolve uma imagem PNG
+    (como data URI) pronta para folium.raster_layers.ImageOverlay, junto
+    com os bounds (lat/lon) efetivamente lidos.
+
+    `bounds_wgs84` é uma tupla (sul, oeste, norte, leste) em graus decimais.
+    """
+    sul, oeste, norte, leste = bounds_wgs84
+
+    with rasterio.open(caminho_raster) as dataset:
+        if dataset.crs is None:
+            raise ValueError("Raster sem sistema de coordenadas (CRS) definido.")
+
+        transformer_wgs84_raster = Transformer.from_crs("EPSG:4326", dataset.crs, always_xy=True)
+        x1, y1 = transformer_wgs84_raster.transform(oeste, sul)
+        x2, y2 = transformer_wgs84_raster.transform(leste, norte)
+        x_min, x_max = sorted((x1, x2))
+        y_min, y_max = sorted((y1, y2))
+
+        # Restringe a janela pedida (bounds atuais do mapa) aos limites reais do raster.
+        x_min = max(x_min, dataset.bounds.left)
+        x_max = min(x_max, dataset.bounds.right)
+        y_min = max(y_min, dataset.bounds.bottom)
+        y_max = min(y_max, dataset.bounds.top)
+        if x_min >= x_max or y_min >= y_max:
+            raise ValueError("A área visível do mapa está fora dos limites da ortofoto.")
+
+        janela = window_from_bounds(x_min, y_min, x_max, y_max, transform=dataset.transform)
+        largura_px = max(1, int(round(janela.width)))
+        altura_px = max(1, int(round(janela.height)))
+        escala = min(1.0, max_dim / max(largura_px, altura_px))
+        largura_alvo = max(1, int(largura_px * escala))
+        altura_alvo = max(1, int(altura_px * escala))
+
+        n_bandas = min(dataset.count, 3)
+        array = dataset.read(
+            indexes=list(range(1, n_bandas + 1)),
+            window=janela,
+            out_shape=(n_bandas, altura_alvo, largura_alvo),
+            resampling=Resampling.bilinear,
+        )
+
+        bounds_janela = window_bounds(janela, transform=dataset.transform)
+        raster_crs = dataset.crs
+
+    transformer_raster_wgs84 = Transformer.from_crs(raster_crs, "EPSG:4326", always_xy=True)
+    lon_min_img, lat_min_img = transformer_raster_wgs84.transform(bounds_janela[0], bounds_janela[1])
+    lon_max_img, lat_max_img = transformer_raster_wgs84.transform(bounds_janela[2], bounds_janela[3])
+
+    array = array.transpose(1, 2, 0)
+    if array.dtype != np.uint8:
+        array = array.astype(np.float32)
+        p2, p98 = np.nanpercentile(array, [2, 98])
+        if p98 > p2:
+            array = np.clip((array - p2) / (p98 - p2) * 255.0, 0, 255)
+        else:
+            array = np.zeros_like(array)
+        array = array.astype(np.uint8)
+
+    if n_bandas == 1:
+        imagem_pil = Image.fromarray(array[:, :, 0], "L")
+    else:
+        imagem_pil = Image.fromarray(array, "RGB")
+
+    buffer_png = io.BytesIO()
+    imagem_pil.save(buffer_png, format="PNG")
+    data_uri = "data:image/png;base64," + base64.b64encode(buffer_png.getvalue()).decode("ascii")
+
+    return data_uri, [[lat_min_img, lon_min_img], [lat_max_img, lon_max_img]]
 
 class PDFRelatorio(FPDF):
     def __init__(self, logo_empresa=None, logo_programa=None):
@@ -390,7 +467,7 @@ def limpar_tudo():
                 pass
 
     st.session_state.reset_key += 1
-    prefixos_para_limpar = ('cache_', 'raster_path_', 'raster_id_', 'raster_mde_path_', 'raster_mde_id_', 'tile_client_', 'marcacoes_', 'select_ponto_', 'pendente_nav_', 'ultimo_clique_')
+    prefixos_para_limpar = ('cache_', 'raster_path_', 'raster_id_', 'raster_mde_path_', 'raster_mde_id_', 'vista_mapa_', 'imagem_recortada_', 'extensao_raster_', 'marcacoes_', 'select_ponto_', 'pendente_nav_', 'ultimo_clique_')
     for key in list(st.session_state.keys()):
         if key.startswith(prefixos_para_limpar):
             del st.session_state[key]
@@ -465,10 +542,18 @@ objetivo = st.radio(
 
 modo_3d, modo_planimetrico, usa_ortofoto, exige_z_gcp, usa_mde = calcula_flags_objetivo(objetivo)
 
+# Se o usuário trocou o Objetivo do Processamento sem clicar em "Limpar Tudo",
+# o resultado em cache é de outro fluxo (colunas diferentes) e não pode
+# continuar sendo exibido — invalida aqui, antes de qualquer outra coisa.
+_cache_obj_key = f'cache_obj_{st.session_state.reset_key}'
+if _cache_obj_key in st.session_state and st.session_state[_cache_obj_key] != objetivo:
+    for _prefixo_cache in ('cache_resultado_', 'cache_epsg_', 'cache_obj_'):
+        st.session_state.pop(f'{_prefixo_cache}{st.session_state.reset_key}', None)
+
 if usa_ortofoto and not LIBS_ORTOFOTO_OK:
     st.error(
         "⚠️ Para usar o Controle Planimétrico 2D é necessário instalar as dependências "
-        "`folium`, `streamlit-folium`, `localtileserver` e `pyproj`.\n\n"
+        "`folium`, `streamlit-folium` e `pyproj`.\n\n"
         f"Detalhe técnico: {ERRO_LIBS_ORTOFOTO}"
     )
 
@@ -946,6 +1031,29 @@ else:
 
 if condicao_passo5:
 
+    # Mesma lógica de invalidação de cache usada para a troca de Objetivo:
+    # se o usuário subiu um novo arquivo de pontos ou um novo raster mantendo
+    # o mesmo Objetivo, o resultado em cache não corresponde mais à entrada
+    # atual e precisa ser descartado (identificador por nome+tamanho, mesmo
+    # padrão usado para o raster da ortofoto).
+    def _identificador_pontos(df):
+        if df is None:
+            return None
+        try:
+            return str(pd.util.hash_pandas_object(df, index=True).sum())
+        except Exception:
+            return None
+
+    _assinatura_entrada_atual = (
+        _identificador_pontos(df_pontos),
+        f"{uploaded_tiff.name}_{uploaded_tiff.size}" if uploaded_tiff is not None else None,
+        f"{uploaded_mde.name}_{uploaded_mde.size}" if uploaded_mde is not None else None,
+    )
+    _chave_assinatura_cache = f'cache_input_sig_{st.session_state.reset_key}'
+    if f'cache_obj_{st.session_state.reset_key}' in st.session_state and st.session_state.get(_chave_assinatura_cache) != _assinatura_entrada_atual:
+        for _prefixo_cache in ('cache_resultado_', 'cache_epsg_', 'cache_obj_', 'cache_input_sig_'):
+            st.session_state.pop(f'{_prefixo_cache}{st.session_state.reset_key}', None)
+
     # ------------------------------------------------------------------
     # MODO: Controle Planimétrico 2D / Análise 3D (marcação interativa sobre a ortofoto)
     # ------------------------------------------------------------------
@@ -980,7 +1088,9 @@ if condicao_passo5:
             # --- Grava a ortofoto em disco (nunca em memória: arquivos podem ter vários GB) ---
             chave_raster_path = f"raster_path_{st.session_state.reset_key}"
             chave_raster_id = f"raster_id_{st.session_state.reset_key}"
-            chave_tile_client = f"tile_client_{st.session_state.reset_key}"
+            chave_vista_mapa = f"vista_mapa_{st.session_state.reset_key}"
+            chave_imagem_recortada = f"imagem_recortada_{st.session_state.reset_key}"
+            chave_extensao_raster = f"extensao_raster_{st.session_state.reset_key}"
             identificador_raster = f"{uploaded_tiff.name}_{uploaded_tiff.size}"
 
             if st.session_state.get(chave_raster_id) != identificador_raster:
@@ -997,9 +1107,22 @@ if condicao_passo5:
                 with open(caminho_raster, "wb") as f_raster:
                     f_raster.write(uploaded_tiff.getbuffer())
 
+                # Overviews internas: custo único por upload, mas evitam ler quase
+                # o arquivo inteiro de um GeoTIFF de vários GB só para montar a
+                # visão inicial (extents completos) em baixa resolução.
+                try:
+                    with rasterio.open(caminho_raster, "r+") as _dataset_overview:
+                        if not _dataset_overview.overviews(1):
+                            _dataset_overview.build_overviews([2, 4, 8, 16, 32, 64], Resampling.average)
+                except Exception:
+                    pass  # Overviews são só uma otimização; a leitura em janela funciona sem elas.
+
                 st.session_state[chave_raster_path] = caminho_raster
                 st.session_state[chave_raster_id] = identificador_raster
-                st.session_state.pop(chave_tile_client, None)
+                # Nova ortofoto: descarta vista/imagem/extensão da ortofoto anterior.
+                st.session_state.pop(chave_vista_mapa, None)
+                st.session_state.pop(chave_imagem_recortada, None)
+                st.session_state.pop(chave_extensao_raster, None)
 
             caminho_raster = st.session_state[chave_raster_path]
 
@@ -1029,17 +1152,23 @@ if condicao_passo5:
 
                 caminho_mde = st.session_state[chave_mde_path]
 
-            if chave_tile_client not in st.session_state:
-                with st.spinner("Preparando a ortofoto para visualização (pode levar alguns instantes em arquivos grandes)..."):
-                    try:
-                        st.session_state[chave_tile_client] = TileClient(caminho_raster)
-                    except Exception as e:
-                        st.error(f"Não foi possível abrir a ortofoto para visualização: {e}")
-                        st.session_state[chave_tile_client] = None
+            if chave_extensao_raster not in st.session_state:
+                try:
+                    with rasterio.open(caminho_raster) as _dataset_extensao:
+                        if _dataset_extensao.crs is None:
+                            st.session_state[chave_extensao_raster] = None
+                        else:
+                            _transformer_extensao = Transformer.from_crs(_dataset_extensao.crs, "EPSG:4326", always_xy=True)
+                            _lon_min, _lat_min = _transformer_extensao.transform(_dataset_extensao.bounds.left, _dataset_extensao.bounds.bottom)
+                            _lon_max, _lat_max = _transformer_extensao.transform(_dataset_extensao.bounds.right, _dataset_extensao.bounds.top)
+                            st.session_state[chave_extensao_raster] = (_lat_min, _lon_min, _lat_max, _lon_max)
+                except Exception as e:
+                    st.error(f"Não foi possível abrir a ortofoto: {e}")
+                    st.session_state[chave_extensao_raster] = None
 
-            client = st.session_state.get(chave_tile_client)
+            extensao_raster = st.session_state.get(chave_extensao_raster)
 
-            if client is None:
+            if extensao_raster is None:
                 st.warning("Verifique se o arquivo é um GeoTIFF válido e georreferenciado.")
             else:
                 chave_marcacoes = f"marcacoes_{st.session_state.reset_key}"
@@ -1102,43 +1231,64 @@ if condicao_passo5:
                     help="Deixe desmarcado para não induzir a marcação ao local esperado do ponto."
                 )
 
-                linha_ponto_atual = df_calc[df_calc[col_id].astype(str) == ponto_escolhido].iloc[0]
-                x_nominal = float(linha_ponto_atual[col_x_val])
-                y_nominal = float(linha_ponto_atual[col_y_val])
-                lon_nominal, lat_nominal = transformer_para_wgs84.transform(x_nominal, y_nominal)
-
-                if ponto_escolhido in marcacoes:
-                    lon_centro, lat_centro = transformer_para_wgs84.transform(
-                        marcacoes[ponto_escolhido]['x'], marcacoes[ponto_escolhido]['y']
-                    )
+                # A vista do mapa (bounds + zoom) é persistida em session_state e
+                # reaplicada a cada rerun — nunca mais recentraliza no ponto atual,
+                # o que resolvia o reset de zoom/posição a cada marcação de ponto.
+                vista_salva = st.session_state.get(chave_vista_mapa)
+                if vista_salva:
+                    sul, oeste, norte, leste = vista_salva["bounds"]
+                    zoom_salvo = vista_salva["zoom"]
                 else:
-                    lon_centro, lat_centro = lon_nominal, lat_nominal
-
-                zoom_maximo_nativo = getattr(client, 'max_zoom', None) or 20
-                zoom_alvo = min(zoom_maximo_nativo, 20)
-                # Permite ampliar além da resolução nativa da ortofoto (over-zoom),
-                # necessário para localizar com precisão os alvos marcados em campo.
-                zoom_maximo_exibicao = zoom_maximo_nativo + 4
+                    sul, oeste, norte, leste = extensao_raster
+                    zoom_salvo = None
 
                 mapa = folium.Map(
-                    location=[lat_centro, lon_centro],
-                    zoom_start=zoom_alvo,
-                    max_zoom=zoom_maximo_exibicao,
+                    location=[(sul + norte) / 2, (oeste + leste) / 2],
+                    zoom_start=zoom_salvo if zoom_salvo is not None else 17,
+                    max_zoom=23,
                     tiles=None,
                     control_scale=True
                 )
-                try:
-                    camada_ortofoto = get_folium_tile_layer(
-                        client,
-                        name="Ortofoto",
-                        max_zoom=zoom_maximo_exibicao,
-                        max_native_zoom=zoom_maximo_nativo,
-                        overlay=False,
-                        control=False,
-                    )
-                    camada_ortofoto.add_to(mapa)
-                except Exception as e:
-                    st.error(f"Erro ao gerar as camadas da ortofoto: {e}")
+                if zoom_salvo is None:
+                    # Ainda sem vista salva (primeira renderização desta ortofoto): enquadra os extents completos.
+                    mapa.fit_bounds([[sul, oeste], [norte, leste]])
+
+                atualizar_vista_clicado = st.button(
+                    "🔄 Atualizar Vista",
+                    help="Recorta a ortofoto novamente para a área atualmente visível no mapa. Navegue/dê zoom e clique aqui para uma imagem mais nítida."
+                )
+
+                # A imagem recortada só é regerada na primeira exibição de cada
+                # ortofoto (visão inicial com os extents completos, em baixa
+                # resolução) ou quando o usuário clica em "Atualizar Vista" — nas
+                # demais interações (navegação entre pontos, cliques de marcação)
+                # a última imagem recortada é reaproveitada, só redesenhando os
+                # marcadores por cima, para manter previsível o custo em rasters grandes.
+                imagem_cache = st.session_state.get(chave_imagem_recortada)
+                if imagem_cache is None or imagem_cache.get("raster_id") != identificador_raster:
+                    with st.spinner("Carregando visão inicial da ortofoto..."):
+                        try:
+                            imagem_uri, bounds_img = gera_overlay_ortofoto(caminho_raster, extensao_raster, max_dim=1000)
+                            imagem_cache = {"raster_id": identificador_raster, "imagem": imagem_uri, "bounds_img": bounds_img}
+                            st.session_state[chave_imagem_recortada] = imagem_cache
+                        except Exception as e:
+                            st.error(f"Não foi possível gerar a visualização inicial da ortofoto: {e}")
+                            imagem_cache = None
+                elif atualizar_vista_clicado:
+                    with st.spinner("Atualizando o recorte da ortofoto para a área visível..."):
+                        try:
+                            imagem_uri, bounds_img = gera_overlay_ortofoto(caminho_raster, (sul, oeste, norte, leste), max_dim=1800)
+                            imagem_cache = {"raster_id": identificador_raster, "imagem": imagem_uri, "bounds_img": bounds_img}
+                            st.session_state[chave_imagem_recortada] = imagem_cache
+                        except Exception as e:
+                            st.error(f"Não foi possível atualizar o recorte da ortofoto: {e}")
+
+                if imagem_cache is not None:
+                    folium.raster_layers.ImageOverlay(
+                        image=imagem_cache["imagem"],
+                        bounds=imagem_cache["bounds_img"],
+                        opacity=1.0,
+                    ).add_to(mapa)
 
                 # O cursor padrão do Leaflet sobre um mapa arrastável é a "mãozinha" de
                 # pan; para a marcação de precisão o usuário precisa da seta comum.
@@ -1186,23 +1336,35 @@ if condicao_passo5:
                     width=1100,
                     height=550,
                     key=f"mapa_ortofoto_{st.session_state.reset_key}_{ponto_escolhido}",
-                    returned_objects=["last_clicked"]
+                    returned_objects=["last_clicked", "bounds", "zoom"]
                 )
 
-                if resultado_mapa and resultado_mapa.get("last_clicked"):
-                    lat_clique = resultado_mapa["last_clicked"]["lat"]
-                    lon_clique = resultado_mapa["last_clicked"]["lng"]
-                    identificador_clique = (ponto_escolhido, round(lat_clique, 10), round(lon_clique, 10))
+                if resultado_mapa:
+                    bounds_retornado = resultado_mapa.get("bounds")
+                    zoom_retornado = resultado_mapa.get("zoom")
+                    if bounds_retornado and zoom_retornado is not None:
+                        sudoeste = bounds_retornado.get("_southWest") or {}
+                        nordeste = bounds_retornado.get("_northEast") or {}
+                        if all(k in sudoeste for k in ("lat", "lng")) and all(k in nordeste for k in ("lat", "lng")):
+                            st.session_state[chave_vista_mapa] = {
+                                "bounds": (sudoeste["lat"], sudoeste["lng"], nordeste["lat"], nordeste["lng"]),
+                                "zoom": zoom_retornado,
+                            }
 
-                    if st.session_state.get(chave_ultimo_clique) != identificador_clique:
-                        st.session_state[chave_ultimo_clique] = identificador_clique
-                        x_marcado, y_marcado = transformer_de_wgs84.transform(lon_clique, lat_clique)
-                        marcacoes[ponto_escolhido] = {"x": x_marcado, "y": y_marcado}
-                        st.session_state[chave_marcacoes] = marcacoes
+                    if resultado_mapa.get("last_clicked"):
+                        lat_clique = resultado_mapa["last_clicked"]["lat"]
+                        lon_clique = resultado_mapa["last_clicked"]["lng"]
+                        identificador_clique = (ponto_escolhido, round(lat_clique, 10), round(lon_clique, 10))
 
-                        if idx_atual < len(lista_ids) - 1:
-                            st.session_state[chave_pendente_nav] = lista_ids[idx_atual + 1]
-                        st.rerun()
+                        if st.session_state.get(chave_ultimo_clique) != identificador_clique:
+                            st.session_state[chave_ultimo_clique] = identificador_clique
+                            x_marcado, y_marcado = transformer_de_wgs84.transform(lon_clique, lat_clique)
+                            marcacoes[ponto_escolhido] = {"x": x_marcado, "y": y_marcado}
+                            st.session_state[chave_marcacoes] = marcacoes
+
+                            if idx_atual < len(lista_ids) - 1:
+                                st.session_state[chave_pendente_nav] = lista_ids[idx_atual + 1]
+                            st.rerun()
 
                 st.write("---")
                 col_final1, col_final2 = st.columns([1, 3])
@@ -1279,6 +1441,7 @@ if condicao_passo5:
                     st.session_state[f'cache_resultado_{st.session_state.reset_key}'] = resultado_final
                     st.session_state[f'cache_epsg_{st.session_state.reset_key}'] = epsg_code
                     st.session_state[f'cache_obj_{st.session_state.reset_key}'] = objetivo
+                    st.session_state[_chave_assinatura_cache] = _assinatura_entrada_atual
 
         except Exception as e:
             st.error(f"Erro durante a preparação do controle planimétrico: {e}")
@@ -1329,6 +1492,7 @@ if condicao_passo5:
                     st.session_state[f'cache_resultado_{st.session_state.reset_key}'] = resultado_final
                     st.session_state[f'cache_epsg_{st.session_state.reset_key}'] = epsg_code
                     st.session_state[f'cache_obj_{st.session_state.reset_key}'] = objetivo
+                    st.session_state[_chave_assinatura_cache] = _assinatura_entrada_atual
 
                 except Exception as e:
                     st.error(f"Erro durante o processamento espacial: {e}")
@@ -1343,127 +1507,141 @@ if condicao_passo5:
         resultado_cache = st.session_state[f'cache_resultado_{st.session_state.reset_key}']
         epsg_cache = st.session_state[f'cache_epsg_{st.session_state.reset_key}']
         obj_cache = st.session_state[f'cache_obj_{st.session_state.reset_key}']
+        colunas_esperadas_por_obj = {
+            "Análise 3D (Planimétrico + Altimétrico)": ['Δ E(X) (m)', 'Δ N(Y) (m)', 'Δ 2D (m)', 'Z (Modelo)', 'Δ Z (m)', 'Δ 3D (m)'],
+            "Controle Planimétrico 2D (Exige Ortofoto)": ['Δ E(X) (m)', 'Δ N(Y) (m)', 'Δ 2D (m)'],
+            "Comparar Cotas (Exige Z do GCP)": ['Discrepância', 'Z (Modelo)'],
+            "Apenas Extrair Z do Modelo": ['Z (Modelo)'],
+        }
+        colunas_esperadas = colunas_esperadas_por_obj.get(obj_cache, [])
+        cache_consistente = all(col in resultado_cache.columns for col in colunas_esperadas)
 
-        stats_dict = {"qtd": len(resultado_cache)}
-        df_exibicao = resultado_cache.copy()
-        casas_coord = 6 if epsg_cache in [4326, 4674] else 3
-        tabela_stats = None
-
-        if obj_cache == "Análise 3D (Planimétrico + Altimétrico)":
-            stats_dict["media_x"] = resultado_cache['Δ E(X) (m)'].mean()
-            stats_dict["desvio_x"] = resultado_cache['Δ E(X) (m)'].std()
-            stats_dict["media_y"] = resultado_cache['Δ N(Y) (m)'].mean()
-            stats_dict["desvio_y"] = resultado_cache['Δ N(Y) (m)'].std()
-            stats_dict["media_2d"] = resultado_cache['Δ 2D (m)'].mean()
-            stats_dict["desvio_2d"] = resultado_cache['Δ 2D (m)'].std()
-            stats_dict["media_z"] = resultado_cache['Δ Z (m)'].mean()
-            stats_dict["desvio_z"] = resultado_cache['Δ Z (m)'].std()
-            stats_dict["media_3d"] = resultado_cache['Δ 3D (m)'].mean()
-            stats_dict["desvio_3d"] = resultado_cache['Δ 3D (m)'].std()
-
-            if resultado_cache['Z (Modelo)'].min() < -10000:
-                st.error("🚨 **Atenção!** Foram detectados valores correspondentes a 'NoData'.")
-
-            for col in ['E(X) (GCP)', 'N(Y) (GCP)', 'E(X) (Foto)', 'N(Y) (Foto)']:
-                df_exibicao[col] = df_exibicao[col].apply(lambda x: formata_br(x, casas_coord))
-            for col in ['Δ E(X) (m)', 'Δ N(Y) (m)', 'Δ 2D (m)', 'Z (GCP)', 'Z (Modelo)', 'Δ Z (m)', 'Δ 3D (m)']:
-                df_exibicao[col] = df_exibicao[col].apply(lambda x: formata_br(x, 3))
-
-            st.caption("As colunas E(X)/N(Y) estão no sistema de coordenadas do projeto (graus ou metros, conforme o Passo 2). As colunas de Delta são sempre expressas em metros.")
-
-            st.metric("Quantidade de Pontos", stats_dict["qtd"])
-
-            tabela_stats = monta_tabela_stats([
-                ("Δ E(X) (m)", stats_dict["media_x"], stats_dict["desvio_x"]),
-                ("Δ N(Y) (m)", stats_dict["media_y"], stats_dict["desvio_y"]),
-                ("Δ 2D (m)", stats_dict["media_2d"], stats_dict["desvio_2d"]),
-                ("Δ Z (m)", stats_dict["media_z"], stats_dict["desvio_z"]),
-                ("Δ 3D (m)", stats_dict["media_3d"], stats_dict["desvio_3d"]),
-            ])
-        elif obj_cache == "Controle Planimétrico 2D (Exige Ortofoto)":
-            stats_dict["media_x"] = resultado_cache['Δ E(X) (m)'].mean()
-            stats_dict["desvio_x"] = resultado_cache['Δ E(X) (m)'].std()
-            stats_dict["media_y"] = resultado_cache['Δ N(Y) (m)'].mean()
-            stats_dict["desvio_y"] = resultado_cache['Δ N(Y) (m)'].std()
-            stats_dict["media_2d"] = resultado_cache['Δ 2D (m)'].mean()
-            stats_dict["desvio_2d"] = resultado_cache['Δ 2D (m)'].std()
-
-            for col in ['E(X) (GCP)', 'N(Y) (GCP)', 'E(X) (Foto)', 'N(Y) (Foto)']:
-                df_exibicao[col] = df_exibicao[col].apply(lambda x: formata_br(x, casas_coord))
-            for col in ['Δ E(X) (m)', 'Δ N(Y) (m)', 'Δ 2D (m)']:
-                df_exibicao[col] = df_exibicao[col].apply(lambda x: formata_br(x, 3))
-
-            st.caption("As colunas E(X)/N(Y) estão no sistema de coordenadas do projeto (graus ou metros, conforme o Passo 2). As colunas de Delta são sempre expressas em metros.")
-
-            st.metric("Quantidade de Pontos", stats_dict["qtd"])
-
-            tabela_stats = monta_tabela_stats([
-                ("Δ E(X) (m)", stats_dict["media_x"], stats_dict["desvio_x"]),
-                ("Δ N(Y) (m)", stats_dict["media_y"], stats_dict["desvio_y"]),
-                ("Δ 2D (m)", stats_dict["media_2d"], stats_dict["desvio_2d"]),
-            ])
+        if not cache_consistente:
+            for prefixo_cache_inv in ('cache_resultado_', 'cache_epsg_', 'cache_obj_'):
+                st.session_state.pop(f'{prefixo_cache_inv}{st.session_state.reset_key}', None)
+            st.info("ℹ️ O resultado exibido não corresponde mais aos dados/Objetivo atuais. Reprocesse para ver o resultado atualizado.")
         else:
-            if resultado_cache['Z (Modelo)'].min() < -10000:
-                st.error("🚨 **Atenção!** Foram detectados valores correspondentes a 'NoData'.")
 
-            if obj_cache == "Comparar Cotas (Exige Z do GCP)":
-                stats_dict["media"] = resultado_cache['Discrepância'].mean()
-                stats_dict["desvio"] = resultado_cache['Discrepância'].std()
+            stats_dict = {"qtd": len(resultado_cache)}
+            df_exibicao = resultado_cache.copy()
+            casas_coord = 6 if epsg_cache in [4326, 4674] else 3
+            tabela_stats = None
 
-                for col in ['E(X)', 'N(Y)']:
+            if obj_cache == "Análise 3D (Planimétrico + Altimétrico)":
+                stats_dict["media_x"] = resultado_cache['Δ E(X) (m)'].mean()
+                stats_dict["desvio_x"] = resultado_cache['Δ E(X) (m)'].std()
+                stats_dict["media_y"] = resultado_cache['Δ N(Y) (m)'].mean()
+                stats_dict["desvio_y"] = resultado_cache['Δ N(Y) (m)'].std()
+                stats_dict["media_2d"] = resultado_cache['Δ 2D (m)'].mean()
+                stats_dict["desvio_2d"] = resultado_cache['Δ 2D (m)'].std()
+                stats_dict["media_z"] = resultado_cache['Δ Z (m)'].mean()
+                stats_dict["desvio_z"] = resultado_cache['Δ Z (m)'].std()
+                stats_dict["media_3d"] = resultado_cache['Δ 3D (m)'].mean()
+                stats_dict["desvio_3d"] = resultado_cache['Δ 3D (m)'].std()
+
+                if resultado_cache['Z (Modelo)'].min() < -10000:
+                    st.error("🚨 **Atenção!** Foram detectados valores correspondentes a 'NoData'.")
+
+                for col in ['E(X) (GCP)', 'N(Y) (GCP)', 'E(X) (Foto)', 'N(Y) (Foto)']:
                     df_exibicao[col] = df_exibicao[col].apply(lambda x: formata_br(x, casas_coord))
-                for col in ['Z (GCP)', 'Z (Modelo)', 'Discrepância']:
+                for col in ['Δ E(X) (m)', 'Δ N(Y) (m)', 'Δ 2D (m)', 'Z (GCP)', 'Z (Modelo)', 'Δ Z (m)', 'Δ 3D (m)']:
                     df_exibicao[col] = df_exibicao[col].apply(lambda x: formata_br(x, 3))
 
-                col_stat1, col_stat2, col_stat3 = st.columns(3)
-                col_stat1.metric("Quantidade de Pontos", stats_dict["qtd"])
-                col_stat2.metric("Média da Discrepância", f"{formata_br(stats_dict['media'], 3)} m")
-                col_stat3.metric("Desvio Padrão", f"{formata_br(stats_dict['desvio'], 3)} m")
-            else:
-                for col in ['E(X)', 'N(Y)']:
+                st.caption("As colunas E(X)/N(Y) estão no sistema de coordenadas do projeto (graus ou metros, conforme o Passo 2). As colunas de Delta são sempre expressas em metros.")
+
+                st.metric("Quantidade de Pontos", stats_dict["qtd"])
+
+                tabela_stats = monta_tabela_stats([
+                    ("Δ E(X) (m)", stats_dict["media_x"], stats_dict["desvio_x"]),
+                    ("Δ N(Y) (m)", stats_dict["media_y"], stats_dict["desvio_y"]),
+                    ("Δ 2D (m)", stats_dict["media_2d"], stats_dict["desvio_2d"]),
+                    ("Δ Z (m)", stats_dict["media_z"], stats_dict["desvio_z"]),
+                    ("Δ 3D (m)", stats_dict["media_3d"], stats_dict["desvio_3d"]),
+                ])
+            elif obj_cache == "Controle Planimétrico 2D (Exige Ortofoto)":
+                stats_dict["media_x"] = resultado_cache['Δ E(X) (m)'].mean()
+                stats_dict["desvio_x"] = resultado_cache['Δ E(X) (m)'].std()
+                stats_dict["media_y"] = resultado_cache['Δ N(Y) (m)'].mean()
+                stats_dict["desvio_y"] = resultado_cache['Δ N(Y) (m)'].std()
+                stats_dict["media_2d"] = resultado_cache['Δ 2D (m)'].mean()
+                stats_dict["desvio_2d"] = resultado_cache['Δ 2D (m)'].std()
+
+                for col in ['E(X) (GCP)', 'N(Y) (GCP)', 'E(X) (Foto)', 'N(Y) (Foto)']:
                     df_exibicao[col] = df_exibicao[col].apply(lambda x: formata_br(x, casas_coord))
-                df_exibicao['Z (Modelo)'] = df_exibicao['Z (Modelo)'].apply(lambda x: formata_br(x, 3))
+                for col in ['Δ E(X) (m)', 'Δ N(Y) (m)', 'Δ 2D (m)']:
+                    df_exibicao[col] = df_exibicao[col].apply(lambda x: formata_br(x, 3))
 
-                st.metric("Quantidade de Pontos Extraídos", stats_dict["qtd"])
+                st.caption("As colunas E(X)/N(Y) estão no sistema de coordenadas do projeto (graus ou metros, conforme o Passo 2). As colunas de Delta são sempre expressas em metros.")
 
-        st.write("")
-        st.dataframe(df_exibicao, use_container_width=True)
+                st.metric("Quantidade de Pontos", stats_dict["qtd"])
 
-        if tabela_stats is not None:
-            st.write("**Estatísticas (Média e Desvio Padrão)**")
-            st.dataframe(tabela_stats, use_container_width=True)
+                tabela_stats = monta_tabela_stats([
+                    ("Δ E(X) (m)", stats_dict["media_x"], stats_dict["desvio_x"]),
+                    ("Δ N(Y) (m)", stats_dict["media_y"], stats_dict["desvio_y"]),
+                    ("Δ 2D (m)", stats_dict["media_2d"], stats_dict["desvio_2d"]),
+                ])
+            else:
+                if resultado_cache['Z (Modelo)'].min() < -10000:
+                    st.error("🚨 **Atenção!** Foram detectados valores correspondentes a 'NoData'.")
 
-        col_btn1, col_btn2 = st.columns(2)
+                if obj_cache == "Comparar Cotas (Exige Z do GCP)":
+                    stats_dict["media"] = resultado_cache['Discrepância'].mean()
+                    stats_dict["desvio"] = resultado_cache['Discrepância'].std()
 
-        df_txt = resultado_cache.copy()
-        for col in ['E(X)', 'N(Y)', 'E(X) (GCP)', 'N(Y) (GCP)', 'E(X) (Foto)', 'N(Y) (Foto)']:
-            if col in df_txt.columns:
-                df_txt[col] = df_txt[col].apply(lambda x: formata_br(x, 6))
-        for col in ['Z (GCP)', 'Z (Modelo)', 'Discrepância', 'Δ E(X) (m)', 'Δ N(Y) (m)', 'Δ 2D (m)', 'Δ Z (m)', 'Δ 3D (m)']:
-            if col in df_txt.columns:
-                df_txt[col] = df_txt[col].apply(lambda x: formata_br(x, 3))
+                    for col in ['E(X)', 'N(Y)']:
+                        df_exibicao[col] = df_exibicao[col].apply(lambda x: formata_br(x, casas_coord))
+                    for col in ['Z (GCP)', 'Z (Modelo)', 'Discrepância']:
+                        df_exibicao[col] = df_exibicao[col].apply(lambda x: formata_br(x, 3))
 
-        txt = df_txt.to_csv(index=False, sep='\t', decimal=',').encode('utf-8')
-        with col_btn1:
-            st.download_button("📥 Baixar Resultados (TXT)", data=txt, file_name='Relatorio.txt', mime='text/plain', key=f"btn_txt_dl_{st.session_state.reset_key}")
+                    col_stat1, col_stat2, col_stat3 = st.columns(3)
+                    col_stat1.metric("Quantidade de Pontos", stats_dict["qtd"])
+                    col_stat2.metric("Média da Discrepância", f"{formata_br(stats_dict['media'], 3)} m")
+                    col_stat3.metric("Desvio Padrão", f"{formata_br(stats_dict['desvio'], 3)} m")
+                else:
+                    for col in ['E(X)', 'N(Y)']:
+                        df_exibicao[col] = df_exibicao[col].apply(lambda x: formata_br(x, casas_coord))
+                    df_exibicao['Z (Modelo)'] = df_exibicao['Z (Modelo)'].apply(lambda x: formata_br(x, 3))
 
-        crs_texto = f"{datum} / Fuso {fuso} {hemisferio} (EPSG:{epsg_cache})" if epsg_cache not in [4326, 4674] else f"{datum} / Lat/Long (EPSG:{epsg_cache})"
+                    st.metric("Quantidade de Pontos Extraídos", stats_dict["qtd"])
 
-        tmp_logo_path = None
-        if uploaded_logo is not None:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp_file:
-                tmp_file.write(uploaded_logo.getvalue())
-                tmp_logo_path = tmp_file.name
+            st.write("")
+            st.dataframe(df_exibicao, use_container_width=True)
 
-        try:
-            pdf_bytes = gerar_pdf(resultado_cache, dicionario_metadados, stats_dict, crs_texto, obj_cache, tmp_logo_path)
-            with col_btn2:
-                st.download_button("📄 Baixar Relatório (PDF)", data=pdf_bytes, file_name='Relatorio_3DCheck.pdf', mime='application/pdf', key=f"btn_pdf_dl_{st.session_state.reset_key}")
-        except Exception as e:
-            st.error(f"Erro ao gerar o PDF: {e}")
-        finally:
-            if tmp_logo_path and os.path.exists(tmp_logo_path):
-                os.remove(tmp_logo_path)
+            if tabela_stats is not None:
+                st.write("**Estatísticas (Média e Desvio Padrão)**")
+                st.dataframe(tabela_stats, use_container_width=True)
+
+            col_btn1, col_btn2 = st.columns(2)
+
+            df_txt = resultado_cache.copy()
+            for col in ['E(X)', 'N(Y)', 'E(X) (GCP)', 'N(Y) (GCP)', 'E(X) (Foto)', 'N(Y) (Foto)']:
+                if col in df_txt.columns:
+                    df_txt[col] = df_txt[col].apply(lambda x: formata_br(x, 6))
+            for col in ['Z (GCP)', 'Z (Modelo)', 'Discrepância', 'Δ E(X) (m)', 'Δ N(Y) (m)', 'Δ 2D (m)', 'Δ Z (m)', 'Δ 3D (m)']:
+                if col in df_txt.columns:
+                    df_txt[col] = df_txt[col].apply(lambda x: formata_br(x, 3))
+
+            txt = df_txt.to_csv(index=False, sep='\t', decimal=',').encode('utf-8')
+            with col_btn1:
+                st.download_button("📥 Baixar Resultados (TXT)", data=txt, file_name='Relatorio.txt', mime='text/plain', key=f"btn_txt_dl_{st.session_state.reset_key}")
+
+            crs_texto = f"{datum} / Fuso {fuso} {hemisferio} (EPSG:{epsg_cache})" if epsg_cache not in [4326, 4674] else f"{datum} / Lat/Long (EPSG:{epsg_cache})"
+
+            tmp_logo_path = None
+            if uploaded_logo is not None:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp_file:
+                    tmp_file.write(uploaded_logo.getvalue())
+                    tmp_logo_path = tmp_file.name
+
+            try:
+                pdf_bytes = gerar_pdf(resultado_cache, dicionario_metadados, stats_dict, crs_texto, obj_cache, tmp_logo_path)
+                with col_btn2:
+                    st.download_button("📄 Baixar Relatório (PDF)", data=pdf_bytes, file_name='Relatorio_3DCheck.pdf', mime='application/pdf', key=f"btn_pdf_dl_{st.session_state.reset_key}")
+            except Exception as e:
+                st.error(f"Erro ao gerar o PDF: {e}")
+            finally:
+                if tmp_logo_path and os.path.exists(tmp_logo_path):
+                    os.remove(tmp_logo_path)
 
 # ==========================================
 # RODAPÉ
