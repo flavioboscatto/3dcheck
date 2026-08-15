@@ -430,7 +430,13 @@ st.set_page_config(page_title="3DCheck", layout="wide")
 
 st.markdown("""
     <style>
-        /* Oculta o texto de limite de tamanho no uploader */
+        /* Oculta o texto nativo de limite de tamanho no uploader (o app mostra
+           seu próprio texto de limite, mais claro, ao lado de cada uploader).
+           stFileUploaderDropzoneInstructions é o test-id atual (Streamlit
+           1.61); os seletores antigos ficam como fallback para outras versões. */
+        [data-testid="stFileUploaderDropzoneInstructions"] {
+            display: none !important;
+        }
         [data-testid="stFileUploadDropzone"] small {
             display: none !important;
         }
@@ -483,7 +489,7 @@ def limpar_tudo():
                 pass
 
     st.session_state.reset_key += 1
-    prefixos_para_limpar = ('cache_', 'raster_path_', 'raster_id_', 'raster_mde_path_', 'raster_mde_id_', 'zoom_mapa_', 'imagem_recortada_', 'extensao_raster_', 'marcacoes_', 'select_ponto_', 'pendente_nav_', 'ultimo_clique_')
+    prefixos_para_limpar = ('cache_', 'raster_path_', 'raster_id_', 'raster_mde_path_', 'raster_mde_id_', 'zoom_mapa_', 'imagem_recortada_', 'extensao_raster_', 'marcacoes_', 'select_ponto_', 'pendente_nav_', 'ultimo_clique_', 'modo_coleta_')
     for key in list(st.session_state.keys()):
         if key.startswith(prefixos_para_limpar):
             del st.session_state[key]
@@ -1248,6 +1254,16 @@ if condicao_passo5:
                     help="Deixe desmarcado para não induzir a marcação ao local esperado do ponto."
                 )
 
+                # Modo de coleta: só enquanto ativo o clique no mapa marca o ponto
+                # (com cursor em cruz, de alta precisão); fora dele o mapa serve só
+                # para navegar/dar zoom sem risco de marcar sem querer.
+                chave_modo_coleta = f"modo_coleta_{st.session_state.reset_key}"
+                modo_coleta = st.session_state.get(chave_modo_coleta, False)
+                rotulo_coleta = "⏹️ Encerrar Coleta" if modo_coleta else "🎯 Coletar Ponto"
+                if st.button(rotulo_coleta, type="primary" if modo_coleta else "secondary", use_container_width=True):
+                    st.session_state[chave_modo_coleta] = not modo_coleta
+                    st.rerun()
+
                 # Centro do mapa: coordenada já marcada (se houver) ou nominal do
                 # GCP do ponto atual — a navegação Anterior/Próximo/avanço
                 # automático continua levando o mapa até o ponto certo.
@@ -1316,11 +1332,13 @@ if condicao_passo5:
                         opacity=1.0,
                     ).add_to(mapa)
 
-                # O cursor padrão do Leaflet sobre um mapa arrastável é a "mãozinha" de
-                # pan; para a marcação de precisão o usuário precisa da seta comum.
+                # Fora do modo de coleta, cursor de "mãozinha" padrão do Leaflet
+                # (deixa claro que o mapa só está sendo navegado). Durante a coleta,
+                # cursor em cruz para marcar o ponto com o máximo de precisão.
+                cursor_mapa = "crosshair" if modo_coleta else "grab"
                 mapa.get_root().html.add_child(folium.Element(
                     "<style>.leaflet-container, .leaflet-grab, .leaflet-dragging .leaflet-grab, "
-                    ".leaflet-interactive { cursor: default !important; }</style>"
+                    f".leaflet-interactive {{ cursor: {cursor_mapa} !important; }}</style>"
                 ))
 
                 # Marcadores azuis (coordenada nominal) de TODOS os pontos, cada um com
@@ -1355,7 +1373,10 @@ if condicao_passo5:
                 if mostrar_marcador_nominal:
                     partes_legenda.append("marcador azul = coordenada nominal do GCP")
                 partes_legenda.append("marcador vermelho = posição já marcada")
-                st.info(f"🎯 Localize e clique com precisão sobre a feição correspondente ao ponto **{ponto_escolhido}** ({'; '.join(partes_legenda)}).")
+                if modo_coleta:
+                    st.info(f"🎯 Modo coleta ativo: clique com precisão sobre a feição correspondente ao ponto **{ponto_escolhido}** ({'; '.join(partes_legenda)}).")
+                else:
+                    st.caption(f"Navegue/dê zoom à vontade sem risco de marcar sem querer. Clique em **🎯 Coletar Ponto** quando estiver pronto para marcar **{ponto_escolhido}** ({'; '.join(partes_legenda)}).")
 
                 resultado_mapa = st_folium(
                     mapa,
@@ -1370,7 +1391,7 @@ if condicao_passo5:
                     if zoom_retornado is not None:
                         st.session_state[chave_zoom_mapa] = zoom_retornado
 
-                    if resultado_mapa.get("last_clicked"):
+                    if modo_coleta and resultado_mapa.get("last_clicked"):
                         lat_clique = resultado_mapa["last_clicked"]["lat"]
                         lon_clique = resultado_mapa["last_clicked"]["lng"]
                         identificador_clique = (ponto_escolhido, round(lat_clique, 10), round(lon_clique, 10))
