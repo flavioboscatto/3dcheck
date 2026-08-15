@@ -1,0 +1,11 @@
+streamlit==1.61.1
+pandas==3.0.5
+geopandas==1.1.4
+shapely==2.1.2
+rasterio==1.5.1
+fpdf2==2.8.8
+python-calamine==0.8.2
+folium==0.20.0
+streamlit-folium==0.27.4
+localtileserver==1.0.0
+pyproj==3.7.2
