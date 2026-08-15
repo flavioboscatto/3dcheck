@@ -489,7 +489,7 @@ def limpar_tudo():
                 pass
 
     st.session_state.reset_key += 1
-    prefixos_para_limpar = ('cache_', 'raster_path_', 'raster_id_', 'raster_mde_path_', 'raster_mde_id_', 'vista_ponto_', 'imagem_recortada_', 'extensao_raster_', 'marcacoes_', 'select_ponto_', 'pendente_nav_', 'ultimo_clique_', 'modo_coleta_')
+    prefixos_para_limpar = ('cache_', 'raster_path_', 'raster_id_', 'raster_mde_path_', 'raster_mde_id_', 'imagem_recortada_', 'extensao_raster_', 'marcacoes_', 'select_ponto_', 'pendente_nav_', 'ultimo_clique_', 'modo_coleta_')
     for key in list(st.session_state.keys()):
         if key.startswith(prefixos_para_limpar):
             del st.session_state[key]
@@ -1111,7 +1111,6 @@ if condicao_passo5:
             # --- Grava a ortofoto em disco (nunca em memória: arquivos podem ter vários GB) ---
             chave_raster_path = f"raster_path_{st.session_state.reset_key}"
             chave_raster_id = f"raster_id_{st.session_state.reset_key}"
-            chave_vista_ponto = f"vista_ponto_{st.session_state.reset_key}"
             chave_imagem_recortada = f"imagem_recortada_{st.session_state.reset_key}"
             chave_extensao_raster = f"extensao_raster_{st.session_state.reset_key}"
             identificador_raster = f"{uploaded_tiff.name}_{uploaded_tiff.size}"
@@ -1142,8 +1141,7 @@ if condicao_passo5:
 
                 st.session_state[chave_raster_path] = caminho_raster
                 st.session_state[chave_raster_id] = identificador_raster
-                # Nova ortofoto: descarta vista/imagem/extensão da ortofoto anterior.
-                st.session_state.pop(chave_vista_ponto, None)
+                # Nova ortofoto: descarta imagem/extensão da ortofoto anterior.
                 st.session_state.pop(chave_imagem_recortada, None)
                 st.session_state.pop(chave_extensao_raster, None)
 
@@ -1279,57 +1277,67 @@ if condicao_passo5:
                 else:
                     lon_centro, lat_centro = lon_nominal, lat_nominal
 
-                # A posição/zoom do mapa (bounds) só é reaproveitada exatamente como
-                # estava enquanto o usuário continuar no MESMO ponto — qualquer rerun
-                # nessa condição (marcar checkbox, clicar em Coletar Ponto, um
-                # zoom/pan que dispara sincronização do componente, etc.) reproduz o
-                # bounds exato relatado pela última interação, sem "puxar" a vista de
-                # volta para o centro do ponto. Isso é o que evita o zoom "voltando"
-                # sozinho: como o bounds restaurado é idêntico ao que o Leaflet já
-                # tinha, o remonte do mapa (inevitável a cada rerun do Streamlit) fica
-                # visualmente estável, permitindo aproximar livremente. Só ao MUDAR de
-                # ponto (navegação Anterior/Próximo/avanço automático) a vista é
-                # recalculada, centralizada no novo ponto.
-                vista_salva = st.session_state.get(chave_vista_ponto)
+                # O mapa NÃO sincroniza pan/zoom de volta para o Python (o
+                # componente só reporta cliques — "bounds"/"zoom" propositalmente
+                # não estão em returned_objects mais abaixo). Isso é o que garante
+                # que dar zoom com o mouse nunca dispare um rerun/remonte do mapa
+                # por conta própria: enquanto o usuário só navega no mapa já
+                # carregado, o zoom fica 100% em controle dele, sem "voltar"
+                # sozinho. A vista só é recalculada quando o PYTHON tem um motivo
+                # explícito pra isso: o ponto mudou, ou o usuário clicou em
+                # "Atualizar Vista"/"Vista Geral".
                 ZOOM_PADRAO_MAPA = 19
-                if vista_salva and vista_salva.get("ponto") == ponto_escolhido:
-                    sul, oeste, norte, leste = vista_salva["bounds"]
-                else:
-                    sul, oeste, norte, leste = calcula_bounds_por_zoom(lat_centro, lon_centro, ZOOM_PADRAO_MAPA)
+                ZOOM_MAXIMO_RECORTE = 23
+                INCREMENTO_ATUALIZAR = 2
 
-                mapa = folium.Map(
-                    location=[(sul + norte) / 2, (oeste + leste) / 2],
-                    zoom_start=ZOOM_PADRAO_MAPA,
-                    max_zoom=23,
-                    tiles=None,
-                    control_scale=True
-                )
-                mapa.fit_bounds([[sul, oeste], [norte, leste]])
-
-                atualizar_vista_clicado = st.button(
-                    "🔄 Atualizar Vista",
-                    help="Recorta a ortofoto novamente para a área/zoom em que o mapa está agora. Use depois de aproximar bastante o zoom, para uma imagem mais nítida."
-                )
-
-                # A imagem recortada é regerada automaticamente sempre que o ponto
-                # atual muda (para o mapa já aparecer com a área certa ao navegar)
-                # ou quando o usuário clica em "Atualizar Vista" — nunca sozinha a
-                # cada pequeno pan/zoom, para manter previsível o custo de
-                # processamento em rasters de vários GB.
                 imagem_cache = st.session_state.get(chave_imagem_recortada)
-                precisa_recortar = (
+                ponto_mudou = (
                     imagem_cache is None
                     or imagem_cache.get("raster_id") != identificador_raster
                     or imagem_cache.get("ponto") != ponto_escolhido
-                    or atualizar_vista_clicado
                 )
-                if precisa_recortar:
-                    with st.spinner("Recortando a ortofoto ao redor do ponto atual..."):
+                nivel_atual = "ponto" if ponto_mudou else imagem_cache.get("nivel", "ponto")
+                zoom_recorte_atual = ZOOM_PADRAO_MAPA if ponto_mudou else imagem_cache.get("zoom_recorte", ZOOM_PADRAO_MAPA)
+
+                col_btn_atualizar, col_btn_geral = st.columns(2)
+                with col_btn_atualizar:
+                    atualizar_vista_clicado = st.button(
+                        "🔄 Atualizar Vista",
+                        use_container_width=True,
+                        help="A imagem ficou borrada de tanto dar zoom? Clique aqui para buscar um recorte mais nítido e detalhado ao redor do ponto atual."
+                    )
+                with col_btn_geral:
+                    vista_geral_clicado = st.button(
+                        "🌍 Vista Geral",
+                        use_container_width=True,
+                        help="Mostra a ortofoto inteira, para você se localizar."
+                    )
+
+                if vista_geral_clicado:
+                    nivel_atual = "geral"
+                elif atualizar_vista_clicado:
+                    zoom_recorte_atual = ZOOM_PADRAO_MAPA if nivel_atual == "geral" else min(zoom_recorte_atual + INCREMENTO_ATUALIZAR, ZOOM_MAXIMO_RECORTE)
+                    nivel_atual = "ponto"
+
+                # A imagem recortada só é regerada quando há um motivo explícito:
+                # o ponto mudou, ou um dos dois botões foi clicado — nunca sozinha
+                # por causa de pan/zoom, para manter previsível o custo de
+                # processamento em rasters de vários GB.
+                if ponto_mudou or atualizar_vista_clicado or vista_geral_clicado:
+                    with st.spinner("Recortando a ortofoto..."):
                         try:
-                            imagem_uri, bounds_img = gera_overlay_ortofoto(caminho_raster, (sul, oeste, norte, leste), max_dim=1800)
+                            if nivel_atual == "geral":
+                                bounds_recorte = extensao_raster
+                                max_dim_recorte = 1200
+                            else:
+                                bounds_recorte = calcula_bounds_por_zoom(lat_centro, lon_centro, zoom_recorte_atual)
+                                max_dim_recorte = 1800
+                            imagem_uri, bounds_img = gera_overlay_ortofoto(caminho_raster, bounds_recorte, max_dim=max_dim_recorte)
                             imagem_cache = {
                                 "raster_id": identificador_raster,
                                 "ponto": ponto_escolhido,
+                                "nivel": nivel_atual,
+                                "zoom_recorte": zoom_recorte_atual,
                                 "imagem": imagem_uri,
                                 "bounds_img": bounds_img,
                             }
@@ -1337,7 +1345,15 @@ if condicao_passo5:
                         except Exception as e:
                             st.error(f"Não foi possível recortar a ortofoto: {e}")
 
+                mapa = folium.Map(
+                    location=[lat_centro, lon_centro],
+                    zoom_start=ZOOM_PADRAO_MAPA,
+                    max_zoom=23,
+                    tiles=None,
+                    control_scale=True
+                )
                 if imagem_cache is not None:
+                    mapa.fit_bounds(imagem_cache["bounds_img"])
                     folium.raster_layers.ImageOverlay(
                         image=imagem_cache["imagem"],
                         bounds=imagem_cache["bounds_img"],
@@ -1395,34 +1411,30 @@ if condicao_passo5:
                     width=1100,
                     height=550,
                     key=f"mapa_ortofoto_{st.session_state.reset_key}_{ponto_escolhido}",
-                    returned_objects=["last_clicked", "bounds"]
+                    returned_objects=["last_clicked"]
                 )
 
-                if resultado_mapa:
-                    bounds_retornado = resultado_mapa.get("bounds")
-                    if bounds_retornado:
-                        sudoeste = bounds_retornado.get("_southWest") or {}
-                        nordeste = bounds_retornado.get("_northEast") or {}
-                        if all(k in sudoeste for k in ("lat", "lng")) and all(k in nordeste for k in ("lat", "lng")):
-                            st.session_state[chave_vista_ponto] = {
-                                "ponto": ponto_escolhido,
-                                "bounds": (sudoeste["lat"], sudoeste["lng"], nordeste["lat"], nordeste["lng"]),
-                            }
+                if resultado_mapa and resultado_mapa.get("last_clicked"):
+                    lat_clique = resultado_mapa["last_clicked"]["lat"]
+                    lon_clique = resultado_mapa["last_clicked"]["lng"]
+                    identificador_clique = (ponto_escolhido, round(lat_clique, 10), round(lon_clique, 10))
 
-                    if modo_coleta and resultado_mapa.get("last_clicked"):
-                        lat_clique = resultado_mapa["last_clicked"]["lat"]
-                        lon_clique = resultado_mapa["last_clicked"]["lng"]
-                        identificador_clique = (ponto_escolhido, round(lat_clique, 10), round(lon_clique, 10))
+                    # Sempre marca o clique como "já visto" (mesmo fora do modo coleta) —
+                    # assim, se um clique acontecer enquanto o usuário só está navegando
+                    # (sem a cruz ativa), ele não fica "pendente" para ser processado por
+                    # engano como marcação assim que o modo coleta for ligado depois.
+                    clique_e_novo = st.session_state.get(chave_ultimo_clique) != identificador_clique
+                    st.session_state[chave_ultimo_clique] = identificador_clique
 
-                        if st.session_state.get(chave_ultimo_clique) != identificador_clique:
-                            st.session_state[chave_ultimo_clique] = identificador_clique
-                            x_marcado, y_marcado = transformer_de_wgs84.transform(lon_clique, lat_clique)
-                            marcacoes[ponto_escolhido] = {"x": x_marcado, "y": y_marcado}
-                            st.session_state[chave_marcacoes] = marcacoes
+                    if clique_e_novo and modo_coleta:
+                        x_marcado, y_marcado = transformer_de_wgs84.transform(lon_clique, lat_clique)
+                        marcacoes[ponto_escolhido] = {"x": x_marcado, "y": y_marcado}
+                        st.session_state[chave_marcacoes] = marcacoes
+                        st.toast(f"✅ Ponto {ponto_escolhido} marcado.")
 
-                            if idx_atual < len(lista_ids) - 1:
-                                st.session_state[chave_pendente_nav] = lista_ids[idx_atual + 1]
-                            st.rerun()
+                        if idx_atual < len(lista_ids) - 1:
+                            st.session_state[chave_pendente_nav] = lista_ids[idx_atual + 1]
+                        st.rerun()
 
                 st.write("---")
                 col_final1, col_final2 = st.columns([1, 3])
