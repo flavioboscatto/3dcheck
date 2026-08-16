@@ -623,6 +623,7 @@ modo_importacao = st.radio(
 df_pontos = None
 col_id, col_x_val, col_y_val, col_z_val = None, None, None, None
 linha_inicio = 1
+tipo_coord_salvar = tipo_coord
 
 if modo_importacao == "Carregar Projeto Salvo (JSON)":
     uploaded_json = st.file_uploader("Selecione o arquivo JSON gerado anteriormente", type=["json"], key=f"json_{st.session_state.reset_key}")
@@ -642,10 +643,10 @@ if modo_importacao == "Carregar Projeto Salvo (JSON)":
             # deixando flags como modo_3d/exige_z_gcp inconsistentes com o objetivo
             # realmente selecionado, o que já causou um KeyError ao processar.
 
-            col_id = dados_json["mapeamento_colunas"]["id"]
-            col_x_val = dados_json["mapeamento_colunas"]["easting"]
-            col_y_val = dados_json["mapeamento_colunas"]["northing"]
-            col_z_val = dados_json["mapeamento_colunas"].get("cota_z", None)
+            col_id_json = dados_json["mapeamento_colunas"]["id"]
+            col_x_json = dados_json["mapeamento_colunas"]["easting"]
+            col_y_json = dados_json["mapeamento_colunas"]["northing"]
+            col_z_json = dados_json["mapeamento_colunas"].get("cota_z", None)
 
             # Só reaplica os campos (e reinicia) se este JSON ainda não foi carregado nesta sessão
             chave_controle = f"_json_aplicado_{st.session_state.reset_key}"
@@ -656,8 +657,35 @@ if modo_importacao == "Carregar Projeto Salvo (JSON)":
                 st.rerun()
 
             st.success("✅ Projeto carregado com sucesso!")
-            st.write("### Pré-visualização dos Dados")
-            st.dataframe(df_pontos.head())
+            st.info("ℹ️ A ortofoto e o MDE/MDS não ficam salvos dentro do JSON — reenvie-os no Passo 4 para continuar o trabalho.")
+
+            # Mapeamento reaberto para edição (não apenas herdado do JSON): permite
+            # trocar a coluna Z ao alternar o Objetivo para um modo que a exige
+            # (ex.: JSON salvo como 2D e depois promovido para 3D), o que antes
+            # ficava travado em cota_z=None e quebrava o cálculo mais adiante.
+            st.subheader("Mapeamento de Colunas")
+            colunas_disponiveis = df_pontos.columns.tolist()
+
+            def _indice_ou_zero(valor, opcoes):
+                return opcoes.index(valor) if valor in opcoes else 0
+
+            col_nome, col_x, col_y, col_z = st.columns(4)
+            with col_nome:
+                col_id = st.selectbox("Coluna **Nome/ID**", options=colunas_disponiveis, index=_indice_ou_zero(col_id_json, colunas_disponiveis), key=f"col_id_json_{st.session_state.reset_key}")
+            with col_x:
+                col_x_val = st.selectbox("Coluna **E(X) - Easting / Long**", options=colunas_disponiveis, index=_indice_ou_zero(col_x_json, colunas_disponiveis), key=f"col_x_json_{st.session_state.reset_key}")
+            with col_y:
+                col_y_val = st.selectbox("Coluna **N(Y) - Northing / Lat**", options=colunas_disponiveis, index=_indice_ou_zero(col_y_json, colunas_disponiveis), key=f"col_y_json_{st.session_state.reset_key}")
+            with col_z:
+                if exige_z_gcp:
+                    col_z_val = st.selectbox("Coluna **Z (GCP)**", options=colunas_disponiveis, index=_indice_ou_zero(col_z_json, colunas_disponiveis), key=f"col_z_json_{st.session_state.reset_key}")
+                else:
+                    col_z_val = None
+                    st.info("Modo de Extração: Coluna Z não é necessária.")
+
+            st.write("### Tabela Organizada")
+            colunas_organizadas = [col_id, col_x_val, col_y_val] + ([col_z_val] if (exige_z_gcp and col_z_val is not None) else [])
+            st.dataframe(df_pontos[colunas_organizadas], use_container_width=True)
         except Exception as e:
             st.error(f"Erro ao ler o arquivo JSON. Erro: {e}")
 
@@ -738,42 +766,18 @@ elif modo_importacao == "Importar Planilha SIGEF (.ods)":
             
             df_pontos = df_pontos.dropna(subset=[col_x_val, col_y_val])
 
-            st.write("### Dados Convertidos (Graus Decimais)")
+            st.write("### Tabela Organizada")
             st.dataframe(
-                df_pontos[[col_id, col_x_val, col_y_val]].head(),
+                df_pontos[[col_id, col_x_val, col_y_val]],
+                use_container_width=True,
                 column_config={
                     col_x_val: st.column_config.NumberColumn(format="%.6f"),
                     col_y_val: st.column_config.NumberColumn(format="%.6f")
                 }
             )
-            
-            dados_json = {
-                "metadados": dicionario_metadados,
-                "configuracao_src": {
-                    "datum": datum,
-                    "tipo_coord": "Geodésica (Lat/Long)", 
-                    "fuso": fuso,
-                    "hemisferio": hemisferio,
-                    "linha_inicio": linha_cabecalho_sigef,
-                    "objetivo": objetivo
-                },
-                "mapeamento_colunas": {
-                    "id": col_id,
-                    "easting": col_x_val,
-                    "northing": col_y_val,
-                    "cota_z": col_z_val
-                },
-                "dados_pontos": json.loads(df_pontos.to_json(orient="records"))
-            }
-            json_string = json.dumps(dados_json, indent=4, ensure_ascii=False)
 
-            st.download_button(
-                label="💾 Salvar Workspace (JSON)",
-                data=json_string,
-                file_name="3DCheck_Projeto.json",
-                mime="application/json",
-                key=f"btn_json_{st.session_state.reset_key}"
-            )
+            linha_inicio = linha_cabecalho_sigef
+            tipo_coord_salvar = "Geodésica (Lat/Long)"
         except Exception as e:
             st.error(f"Erro ao processar planilha SIGEF. Erro: {e}")
 
@@ -817,36 +821,8 @@ elif modo_importacao == "Importar txt ProGrid":
                     modo_3d, modo_planimetrico, usa_ortofoto, exige_z_gcp, usa_mde = calcula_flags_objetivo(objetivo)
                     st.info("ℹ️ Modo ajustado para 'Apenas Extrair Z do Modelo', pois o ProGrid não possui cota Z de campo.")
 
-                st.write("### Pré-visualização dos Dados")
-                st.dataframe(df_pontos.head())
-                
-                dados_json = {
-                    "metadados": dicionario_metadados,
-                    "configuracao_src": {
-                        "datum": datum,
-                        "tipo_coord": tipo_coord,
-                        "fuso": fuso,
-                        "hemisferio": hemisferio,
-                        "linha_inicio": 1,
-                        "objetivo": objetivo
-                    },
-                    "mapeamento_colunas": {
-                        "id": col_id,
-                        "easting": col_x_val,
-                        "northing": col_y_val,
-                        "cota_z": col_z_val
-                    },
-                    "dados_pontos": json.loads(df_pontos.to_json(orient="records"))
-                }
-                json_string = json.dumps(dados_json, indent=4, ensure_ascii=False)
-
-                st.download_button(
-                    label="💾 Salvar Workspace (JSON)",
-                    data=json_string,
-                    file_name="3DCheck_Projeto.json",
-                    mime="application/json",
-                    key=f"btn_json_{st.session_state.reset_key}"
-                )
+                st.write("### Tabela Organizada")
+                st.dataframe(df_pontos, use_container_width=True)
         except Exception as e:
             st.error(f"Erro ao processar ProGrid: {e}")
 
@@ -916,34 +892,9 @@ elif modo_importacao == "Nova Importação - TXT / CSV":
 
             df_pontos = df
 
-            dados_json = {
-                "metadados": dicionario_metadados,
-                "configuracao_src": {
-                    "datum": datum,
-                    "tipo_coord": tipo_coord,
-                    "fuso": fuso,
-                    "hemisferio": hemisferio,
-                    "linha_inicio": linha_inicio,
-                    "objetivo": objetivo
-                },
-                "mapeamento_colunas": {
-                    "id": col_id,
-                    "easting": col_x_val,
-                    "northing": col_y_val,
-                    "cota_z": col_z_val
-                },
-                "dados_pontos": json.loads(df.to_json(orient="records"))
-            }
-            json_string = json.dumps(dados_json, indent=4, ensure_ascii=False)
-
-            st.write("")
-            st.download_button(
-                label="💾 Salvar Workspace (JSON)",
-                data=json_string,
-                file_name="3DCheck_Projeto.json",
-                mime="application/json",
-                key=f"btn_json_{st.session_state.reset_key}"
-            )
+            st.write("### Tabela Organizada")
+            colunas_organizadas = [col_id, col_x_val, col_y_val] + ([col_z_val] if (exige_z_gcp and col_z_val is not None) else [])
+            st.dataframe(df_pontos[colunas_organizadas], use_container_width=True)
 
         except Exception as e:
             st.error(f"Não foi possível ler o arquivo. Verifique o separador e a linha de início. Erro: {e}")
@@ -1017,34 +968,39 @@ elif modo_importacao == "Digitar Dados Manualmente":
         col_y_val = nome_y
         col_z_val = "Z (GCP)" if exige_z_gcp else None
 
-        dados_json = {
-            "metadados": dicionario_metadados,
-            "configuracao_src": {
-                "datum": datum,
-                "tipo_coord": tipo_coord,
-                "fuso": fuso,
-                "hemisferio": hemisferio,
-                "linha_inicio": 1,
-                "objetivo": objetivo
-            },
-            "mapeamento_colunas": {
-                "id": col_id,
-                "easting": col_x_val,
-                "northing": col_y_val,
-                "cota_z": col_z_val
-            },
-            "dados_pontos": json.loads(df_pontos.to_json(orient="records"))
-        }
-        json_string = json.dumps(dados_json, indent=4, ensure_ascii=False)
+# ==========================================
+# SALVAR WORKSPACE (JSON) — sempre disponível, mesmo antes de importar pontos,
+# pois também guarda a configuração dos Passos 1 e 2 (metadados, datum, fuso etc.)
+# ==========================================
+st.write("")
+dados_json_salvar = {
+    "metadados": dicionario_metadados,
+    "configuracao_src": {
+        "datum": datum,
+        "tipo_coord": tipo_coord_salvar,
+        "fuso": fuso,
+        "hemisferio": hemisferio,
+        "linha_inicio": linha_inicio,
+        "objetivo": objetivo
+    },
+    "mapeamento_colunas": {
+        "id": col_id,
+        "easting": col_x_val,
+        "northing": col_y_val,
+        "cota_z": col_z_val
+    },
+    "dados_pontos": json.loads(df_pontos.to_json(orient="records")) if df_pontos is not None else []
+}
+json_string_salvar = json.dumps(dados_json_salvar, indent=4, ensure_ascii=False)
 
-        st.write("")
-        st.download_button(
-            label="💾 Salvar Workspace (JSON)",
-            data=json_string,
-            file_name="3DCheck_Projeto.json",
-            mime="application/json",
-            key=f"btn_json_manual_{st.session_state.reset_key}"
-        )
+st.download_button(
+    label="💾 Salvar Workspace (JSON)",
+    data=json_string_salvar,
+    file_name="3DCheck_Projeto.json",
+    mime="application/json",
+    key=f"btn_json_salvar_{st.session_state.reset_key}",
+    help="Salva metadados, configuração e (se já importados) os pontos e o mapeamento de colunas. Ortofoto/MDE não são salvos aqui."
+)
 
 # ==========================================
 # PASSO 4: Importação do Modelo (TIFF) / Ortofoto
