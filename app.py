@@ -241,11 +241,24 @@ def gera_overlay_ortofoto(caminho_raster, bounds_wgs84, max_dim=1800):
         altura_alvo = max(1, int(altura_px * escala))
 
         n_bandas = min(dataset.count, 3)
+        # Reamostragem por MÉDIA DE ÁREA (não bilinear) sempre que a leitura
+        # decima a imagem (escala < 1, ou seja, o recorte nativo tem mais
+        # pixels que max_dim). Bilinear só considera os 2x2 pixels vizinhos
+        # de cada amostra, então ao reduzir fortemente (ex.: GSD de 1-2cm
+        # exigindo mais pixels do que os ~1800 exibidos) ele ignora a maior
+        # parte dos pixels de origem — causando aliasing em alvos pequenos e
+        # de alto contraste (as miras de campo), que passam a "parecer"
+        # deslocados da coordenada real mesmo com os bounds corretos. Average
+        # faz a média de todos os pixels de origem que caem em cada pixel de
+        # saída, eliminando esse viés. Sem decimação (escala == 1, ou seja,
+        # já mostrando na resolução nativa) não há essa distorção, então
+        # bilinear é usado normalmente.
+        resampling_leitura = Resampling.average if escala < 1.0 else Resampling.bilinear
         array = dataset.read(
             indexes=list(range(1, n_bandas + 1)),
             window=janela,
             out_shape=(n_bandas, altura_alvo, largura_alvo),
-            resampling=Resampling.bilinear,
+            resampling=resampling_leitura,
         )
 
         bounds_janela = window_bounds(janela, transform=dataset.transform)
