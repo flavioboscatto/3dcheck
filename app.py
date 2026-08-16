@@ -599,11 +599,14 @@ if modo_importacao == "Carregar Projeto Salvo (JSON)":
             df_pontos = pd.DataFrame(dados_json["dados_pontos"])
             df_pontos.columns = [int(col) if str(col).isdigit() else col for col in df_pontos.columns]
 
-            datum = dados_json["configuracao_src"].get("datum", "SIRGAS2000")
-            tipo_coord = dados_json["configuracao_src"].get("tipo_coord", "UTM")
-            fuso = dados_json["configuracao_src"].get("fuso", 22)
-            hemisferio = dados_json["configuracao_src"].get("hemisferio", "Sul (S)")
-            objetivo = dados_json["configuracao_src"].get("objetivo", "Comparar Cotas (Exige Z do GCP)")
+            # NÃO reatribuir datum/tipo_coord/fuso/hemisferio/objetivo aqui: eles já
+            # vêm corretos dos widgets dos Passos 2 e 3 (o bloco 'pending_json' acima
+            # os pré-carrega com os valores do JSON só na primeira vez que ele é
+            # aplicado). Reatribuí-los aqui, a partir do dict bruto, sobrescreveria
+            # silenciosamente qualquer alteração que o usuário faça depois nesses
+            # widgets (ex.: mudar o Objetivo ou o Fuso) a cada novo rerun — inclusive
+            # deixando flags como modo_3d/exige_z_gcp inconsistentes com o objetivo
+            # realmente selecionado, o que já causou um KeyError ao processar.
 
             col_id = dados_json["mapeamento_colunas"]["id"]
             col_x_val = dados_json["mapeamento_colunas"]["easting"]
@@ -1017,22 +1020,17 @@ st.write("---")
 uploaded_mde = None
 
 if modo_3d:
-    st.header("4. Importação da Ortofoto e do Modelo (MDE/MDS)")
-    st.caption("O modo Análise 3D exige os dois arquivos: a ortofoto para a marcação visual e o MDE/MDS para a extração do Z.")
+    st.header("4. Importação da Ortofoto e do Modelo (MDE/MDS) — 10GB max.")
     col_up_orto, col_up_mde = st.columns(2)
     with col_up_orto:
-        st.caption("Ortofoto georreferenciada (GeoTIFF/COG) — usada para localizar visualmente cada ponto. 📦 Tamanho máximo: 10 GB por arquivo.")
         uploaded_tiff = st.file_uploader("Arraste ou selecione sua ortofoto georreferenciada", type=["tif", "tiff"], key=f"file_tif_{st.session_state.reset_key}")
     with col_up_mde:
-        st.caption("MDE/MDS georreferenciado — usado para extrair o Z do modelo. 📦 Tamanho máximo: 10 GB por arquivo.")
         uploaded_mde = st.file_uploader("Arraste ou selecione seu MDE/MDS georreferenciado", type=["tif", "tiff"], key=f"file_mde_{st.session_state.reset_key}")
 elif modo_planimetrico:
-    st.header("4. Importação da Ortofoto")
-    st.caption("Envie a ortofoto georreferenciada (GeoTIFF/COG) que será usada para localizar visualmente cada ponto de controle. 📦 Tamanho máximo: 10 GB por arquivo.")
+    st.header("4. Importação da Ortofoto — 10GB max.")
     uploaded_tiff = st.file_uploader("Arraste ou selecione sua ortofoto georreferenciada", type=["tif", "tiff"], key=f"file_tif_{st.session_state.reset_key}")
 else:
-    st.header("4. Importação do Modelo (TIFF)")
-    st.caption("📦 Tamanho máximo: 10 GB por arquivo.")
+    st.header("4. Importação do Modelo (TIFF) — 10GB max.")
     uploaded_tiff = st.file_uploader("Arraste ou selecione seu MDE/MDS georreferenciado", type=["tif", "tiff"], key=f"file_tif_{st.session_state.reset_key}")
 
 # ==========================================
@@ -1113,6 +1111,7 @@ if condicao_passo5:
             chave_raster_id = f"raster_id_{st.session_state.reset_key}"
             chave_imagem_recortada = f"imagem_recortada_{st.session_state.reset_key}"
             chave_extensao_raster = f"extensao_raster_{st.session_state.reset_key}"
+            chave_epsg_raster = f"epsg_raster_{st.session_state.reset_key}"
             identificador_raster = f"{uploaded_tiff.name}_{uploaded_tiff.size}"
 
             if st.session_state.get(chave_raster_id) != identificador_raster:
@@ -1141,9 +1140,10 @@ if condicao_passo5:
 
                 st.session_state[chave_raster_path] = caminho_raster
                 st.session_state[chave_raster_id] = identificador_raster
-                # Nova ortofoto: descarta imagem/extensão da ortofoto anterior.
+                # Nova ortofoto: descarta imagem/extensão/CRS da ortofoto anterior.
                 st.session_state.pop(chave_imagem_recortada, None)
                 st.session_state.pop(chave_extensao_raster, None)
+                st.session_state.pop(chave_epsg_raster, None)
 
             caminho_raster = st.session_state[chave_raster_path]
 
@@ -1178,16 +1178,36 @@ if condicao_passo5:
                     with rasterio.open(caminho_raster) as _dataset_extensao:
                         if _dataset_extensao.crs is None:
                             st.session_state[chave_extensao_raster] = None
+                            st.session_state[chave_epsg_raster] = None
                         else:
                             _transformer_extensao = Transformer.from_crs(_dataset_extensao.crs, "EPSG:4326", always_xy=True)
                             _lon_min, _lat_min = _transformer_extensao.transform(_dataset_extensao.bounds.left, _dataset_extensao.bounds.bottom)
                             _lon_max, _lat_max = _transformer_extensao.transform(_dataset_extensao.bounds.right, _dataset_extensao.bounds.top)
                             st.session_state[chave_extensao_raster] = (_lat_min, _lon_min, _lat_max, _lon_max)
+                            try:
+                                st.session_state[chave_epsg_raster] = _dataset_extensao.crs.to_epsg()
+                            except Exception:
+                                st.session_state[chave_epsg_raster] = None
                 except Exception as e:
                     st.error(f"Não foi possível abrir a ortofoto: {e}")
                     st.session_state[chave_extensao_raster] = None
+                    st.session_state[chave_epsg_raster] = None
 
             extensao_raster = st.session_state.get(chave_extensao_raster)
+            epsg_raster = st.session_state.get(chave_epsg_raster)
+
+            if extensao_raster is not None:
+                if epsg_raster is not None and epsg_raster != epsg_code:
+                    st.warning(
+                        f"⚠️ **Atenção ao sistema de coordenadas:** a ortofoto está georreferenciada em "
+                        f"EPSG:{epsg_raster}, mas o projeto está configurado para EPSG:{epsg_code} (Passo 2). "
+                        "Se os pontos aparecerem deslocados da imagem, ajuste o Datum/Fuso/Hemisfério no Passo 2 "
+                        "para o sistema real dos seus dados de campo."
+                    )
+                elif epsg_raster is not None:
+                    st.caption(f"✅ CRS da ortofoto: EPSG:{epsg_raster} — igual ao do projeto.")
+                else:
+                    st.caption("ℹ️ Não foi possível determinar o código EPSG exato da ortofoto (o CRS foi lido, mas sem um EPSG padrão associado).")
 
             if extensao_raster is None:
                 st.warning("Verifique se o arquivo é um GeoTIFF válido e georreferenciado.")
@@ -1286,9 +1306,8 @@ if condicao_passo5:
                 # sozinho. A vista só é recalculada quando o PYTHON tem um motivo
                 # explícito pra isso: o ponto mudou, ou o usuário clicou em
                 # "Atualizar Vista"/"Vista Geral".
-                ZOOM_PADRAO_MAPA = 19
-                ZOOM_MAXIMO_RECORTE = 23
-                INCREMENTO_ATUALIZAR = 2
+                ZOOM_PADRAO_MAPA = 19    # visão inicial ao chegar num ponto
+                ZOOM_DETALHE_MAPA = 22   # visão nítida buscada pelo botão "Atualizar Vista"
 
                 imagem_cache = st.session_state.get(chave_imagem_recortada)
                 ponto_mudou = (
@@ -1297,14 +1316,13 @@ if condicao_passo5:
                     or imagem_cache.get("ponto") != ponto_escolhido
                 )
                 nivel_atual = "ponto" if ponto_mudou else imagem_cache.get("nivel", "ponto")
-                zoom_recorte_atual = ZOOM_PADRAO_MAPA if ponto_mudou else imagem_cache.get("zoom_recorte", ZOOM_PADRAO_MAPA)
 
                 col_btn_atualizar, col_btn_geral = st.columns(2)
                 with col_btn_atualizar:
                     atualizar_vista_clicado = st.button(
                         "🔄 Atualizar Vista",
                         use_container_width=True,
-                        help="A imagem ficou borrada de tanto dar zoom? Clique aqui para buscar um recorte mais nítido e detalhado ao redor do ponto atual."
+                        help="Busca um recorte bem mais nítido e aproximado ao redor do ponto atual — use quando a imagem ficar borrada de tanto dar zoom."
                     )
                 with col_btn_geral:
                     vista_geral_clicado = st.button(
@@ -1316,8 +1334,7 @@ if condicao_passo5:
                 if vista_geral_clicado:
                     nivel_atual = "geral"
                 elif atualizar_vista_clicado:
-                    zoom_recorte_atual = ZOOM_PADRAO_MAPA if nivel_atual == "geral" else min(zoom_recorte_atual + INCREMENTO_ATUALIZAR, ZOOM_MAXIMO_RECORTE)
-                    nivel_atual = "ponto"
+                    nivel_atual = "detalhe"
 
                 # A imagem recortada só é regerada quando há um motivo explícito:
                 # o ponto mudou, ou um dos dois botões foi clicado — nunca sozinha
@@ -1329,15 +1346,17 @@ if condicao_passo5:
                             if nivel_atual == "geral":
                                 bounds_recorte = extensao_raster
                                 max_dim_recorte = 1200
+                            elif nivel_atual == "detalhe":
+                                bounds_recorte = calcula_bounds_por_zoom(lat_centro, lon_centro, ZOOM_DETALHE_MAPA)
+                                max_dim_recorte = 1800
                             else:
-                                bounds_recorte = calcula_bounds_por_zoom(lat_centro, lon_centro, zoom_recorte_atual)
+                                bounds_recorte = calcula_bounds_por_zoom(lat_centro, lon_centro, ZOOM_PADRAO_MAPA)
                                 max_dim_recorte = 1800
                             imagem_uri, bounds_img = gera_overlay_ortofoto(caminho_raster, bounds_recorte, max_dim=max_dim_recorte)
                             imagem_cache = {
                                 "raster_id": identificador_raster,
                                 "ponto": ponto_escolhido,
                                 "nivel": nivel_atual,
-                                "zoom_recorte": zoom_recorte_atual,
                                 "imagem": imagem_uri,
                                 "bounds_img": bounds_img,
                             }
