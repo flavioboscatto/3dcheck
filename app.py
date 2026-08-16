@@ -208,11 +208,28 @@ def gera_overlay_ortofoto(caminho_raster, bounds_wgs84, max_dim=1800):
         x_min, x_max = sorted((x1, x2))
         y_min, y_max = sorted((y1, y2))
 
-        # Restringe a janela pedida (bounds atuais do mapa) aos limites reais do raster.
-        x_min = max(x_min, dataset.bounds.left)
-        x_max = min(x_max, dataset.bounds.right)
-        y_min = max(y_min, dataset.bounds.bottom)
-        y_max = min(y_max, dataset.bounds.top)
+        # Restringe a janela pedida aos limites reais do raster MANTENDO O
+        # CENTRO original (o ponto/coordenada que o recorte deveria mostrar
+        # centralizado). Cortar x_min/x_max/y_min/y_max cada um de forma
+        # independente (min/max contra dataset.bounds) desloca o centro
+        # efetivo do recorte para longe do ponto sempre que a janela pedida
+        # ultrapassa a borda do raster de UM só lado — o que é comum em
+        # ortofotos pequenas (poucas dezenas de metros) com alvos perto da
+        # borda. Isso fazia o recorte parecer "deslocado" do ponto mesmo com
+        # a georreferenciação (imagem e marcador) corretas: o app só estava
+        # mostrando uma área que não era mais a centrada no ponto.
+        x_centro = (x_min + x_max) / 2
+        y_centro = (y_min + y_max) / 2
+        if not (dataset.bounds.left <= x_centro <= dataset.bounds.right
+                and dataset.bounds.bottom <= y_centro <= dataset.bounds.top):
+            raise ValueError(
+                "O ponto/vista atual está fora da área coberta pela ortofoto — "
+                "confira o Datum/Fuso/Hemisfério do projeto (Passo 2) e o CRS da ortofoto."
+            )
+        meia_largura = min((x_max - x_min) / 2, x_centro - dataset.bounds.left, dataset.bounds.right - x_centro)
+        meia_altura = min((y_max - y_min) / 2, y_centro - dataset.bounds.bottom, dataset.bounds.top - y_centro)
+        x_min, x_max = x_centro - meia_largura, x_centro + meia_largura
+        y_min, y_max = y_centro - meia_altura, y_centro + meia_altura
         if x_min >= x_max or y_min >= y_max:
             raise ValueError("A área visível do mapa está fora dos limites da ortofoto.")
 
