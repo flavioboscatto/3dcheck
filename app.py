@@ -5,7 +5,9 @@ from shapely.geometry import Point
 import rasterio
 from rasterio.io import MemoryFile
 from rasterio.enums import Resampling
-from rasterio.windows import Window, bounds as window_bounds
+from rasterio.windows import Window
+from rasterio.transform import array_bounds
+from rasterio.warp import calculate_default_transform, reproject
 import numpy as np
 from PIL import Image
 import json
@@ -171,27 +173,72 @@ def limpa_coords_numericas(df, col_x, col_y, col_z=None):
 
     return df_limpo.dropna(subset=colunas_checar)
 
+def _reprojeta_para_png_wgs84(array_nativo, transform_nativo, raster_crs, n_bandas):
+    """Reprojeta um array já lido do raster (em qualquer CRS) para WGS84
+    (EPSG:4326) e devolve (data_uri PNG, bounds [[lat_min,lon_min],
+    [lat_max,lon_max]]) prontos para folium.raster_layers.ImageOverlay.
+    Compartilhado entre o recorte de detalhe e a vista geral.
+
+    A reprojeção para WGS84 é o que faltava para a imagem não aparecer
+    deslocada: `ImageOverlay` do Leaflet só aceita um retângulo simples
+    [sul,oeste]-[norte,leste], sem rotação — mas o "norte" da grade UTM (ou
+    de qualquer projeção) não aponta exatamente para o norte verdadeiro
+    fora do meridiano central do fuso (convergência de grade). Um recorte
+    lido direto em UTM e tratado como esse retângulo alinhado a lat/lon é,
+    na prática, um paralelogramo levemente girado sendo exibido como se não
+    fosse — isso desloca qualquer feição que não esteja bem no centro do
+    recorte (testado: ~35cm de erro nos cantos de um recorte de 36m só pela
+    convergência de grade numa ortofoto real, sem nenhuma rotação
+    "artificial"). É esse desvio geométrico — não a reamostragem em si —
+    que causava os alvos "fora do lugar". Reprojetar antes de gerar o PNG
+    resolve isso de vez, e é exatamente o que uma tile-server (como o
+    localtileserver usado antes) faz por baixo dos panos. A reprojeção usa
+    vizinho-mais-próximo (sem misturar pixels)."""
+    bounds_nativo = array_bounds(array_nativo.shape[1], array_nativo.shape[2], transform_nativo)
+    dst_transform, largura_dst, altura_dst = calculate_default_transform(
+        raster_crs, "EPSG:4326", array_nativo.shape[2], array_nativo.shape[1], *bounds_nativo
+    )
+    array = np.zeros((n_bandas, altura_dst, largura_dst), dtype=array_nativo.dtype)
+    reproject(
+        source=array_nativo,
+        destination=array,
+        src_transform=transform_nativo,
+        src_crs=raster_crs,
+        dst_transform=dst_transform,
+        dst_crs="EPSG:4326",
+        resampling=Resampling.nearest,
+    )
+
+    lon_min_img, lat_max_img = dst_transform * (0, 0)
+    lon_max_img, lat_min_img = dst_transform * (largura_dst, altura_dst)
+
+    array = array.transpose(1, 2, 0)
+    if array.dtype != np.uint8:
+        array = array.astype(np.float32)
+        p2, p98 = np.nanpercentile(array, [2, 98])
+        if p98 > p2:
+            array = np.clip((array - p2) / (p98 - p2) * 255.0, 0, 255)
+        else:
+            array = np.zeros_like(array)
+        array = array.astype(np.uint8)
+
+    if n_bandas == 1:
+        imagem_pil = Image.fromarray(array[:, :, 0], "L")
+    else:
+        imagem_pil = Image.fromarray(array, "RGB")
+
+    buffer_png = io.BytesIO()
+    imagem_pil.save(buffer_png, format="PNG")
+    data_uri = "data:image/png;base64," + base64.b64encode(buffer_png.getvalue()).decode("ascii")
+
+    return data_uri, [[lat_min_img, lon_min_img], [lat_max_img, lon_max_img]]
+
 def gera_overlay_ortofoto(caminho_raster, lat_centro, lon_centro, raio_px=900):
     """Lê, sob demanda, um bloco de pixels NATIVOS da ortofoto (leitura em
     janela do rasterio — nunca o arquivo inteiro, mesmo em ortofotos de
-    vários GB) centrado em (lat_centro, lon_centro), e devolve uma imagem
-    PNG (como data URI) pronta para folium.raster_layers.ImageOverlay,
-    junto com os bounds (lat/lon) efetivamente lidos.
-
-    De propósito, a janela é sempre um bloco de pixels INTEIROS lido sem
-    NENHUMA reamostragem (nem bilinear, nem average): qualquer forma de
-    interpolação, ao decimar a imagem para caber num limite de pixels de
-    exibição, pode "borrar" ou deslocar visualmente o centro aparente de
-    alvos pequenos e de alto contraste (as miras de campo) — o que já
-    causou o app mostrar os alvos "deslocados" da coordenada real mesmo
-    com a georreferenciação correta. Lendo sempre os pixels originais do
-    arquivo (1:1, sem mistura entre eles), esse deslocamento deixa de
-    poder acontecer. O preço é mostrar uma área menor (em metros) quando o
-    GSD da ortofoto é muito fino — dar mais zoom do que isso na tela é só
-    o navegador ampliando o PNG (ver CSS 'image-rendering: pixelated' no
-    ponto onde o mapa é montado), com vizinho-mais-próximo, sem perder
-    precisão.
-    """
+    vários GB) centrado em (lat_centro, lon_centro) — sem nenhuma
+    reamostragem nessa leitura — e devolve a imagem já reprojetada para
+    WGS84 (ver _reprojeta_para_png_wgs84)."""
     with rasterio.open(caminho_raster) as dataset:
         if dataset.crs is None:
             raise ValueError("Raster sem sistema de coordenadas (CRS) definido.")
@@ -214,35 +261,37 @@ def gera_overlay_ortofoto(caminho_raster, lat_centro, lon_centro, raio_px=900):
 
         janela = Window(col_ini, row_ini, col_fim - col_ini, row_fim - row_ini)
         n_bandas = min(dataset.count, 3)
-        array = dataset.read(indexes=list(range(1, n_bandas + 1)), window=janela)
-
-        bounds_janela = window_bounds(janela, transform=dataset.transform)
+        array_nativo = dataset.read(indexes=list(range(1, n_bandas + 1)), window=janela)
+        transform_nativo = dataset.window_transform(janela)
         raster_crs = dataset.crs
 
-    transformer_raster_wgs84 = Transformer.from_crs(raster_crs, "EPSG:4326", always_xy=True)
-    lon_min_img, lat_min_img = transformer_raster_wgs84.transform(bounds_janela[0], bounds_janela[1])
-    lon_max_img, lat_max_img = transformer_raster_wgs84.transform(bounds_janela[2], bounds_janela[3])
+    return _reprojeta_para_png_wgs84(array_nativo, transform_nativo, raster_crs, n_bandas)
 
-    array = array.transpose(1, 2, 0)
-    if array.dtype != np.uint8:
-        array = array.astype(np.float32)
-        p2, p98 = np.nanpercentile(array, [2, 98])
-        if p98 > p2:
-            array = np.clip((array - p2) / (p98 - p2) * 255.0, 0, 255)
-        else:
-            array = np.zeros_like(array)
-        array = array.astype(np.uint8)
+def gera_overlay_ortofoto_geral(caminho_raster, max_dim=1500):
+    """Lê a ortofoto INTEIRA, decimada (aproveitando as overviews internas
+    já construídas no upload — ver build_overviews) até no máximo `max_dim`
+    pixels no lado maior, e devolve a imagem já reprojetada para WGS84 (ver
+    _reprojeta_para_png_wgs84) — usada só para o usuário se localizar
+    (Vista Geral), não para marcar pontos com precisão."""
+    with rasterio.open(caminho_raster) as dataset:
+        if dataset.crs is None:
+            raise ValueError("Raster sem sistema de coordenadas (CRS) definido.")
 
-    if n_bandas == 1:
-        imagem_pil = Image.fromarray(array[:, :, 0], "L")
-    else:
-        imagem_pil = Image.fromarray(array, "RGB")
+        n_bandas = min(dataset.count, 3)
+        escala = min(1.0, max_dim / max(dataset.width, dataset.height))
+        largura_alvo = max(1, int(dataset.width * escala))
+        altura_alvo = max(1, int(dataset.height * escala))
+        array_nativo = dataset.read(
+            indexes=list(range(1, n_bandas + 1)),
+            out_shape=(n_bandas, altura_alvo, largura_alvo),
+            resampling=Resampling.nearest,
+        )
+        transform_nativo = dataset.transform * dataset.transform.scale(
+            dataset.width / largura_alvo, dataset.height / altura_alvo
+        )
+        raster_crs = dataset.crs
 
-    buffer_png = io.BytesIO()
-    imagem_pil.save(buffer_png, format="PNG")
-    data_uri = "data:image/png;base64," + base64.b64encode(buffer_png.getvalue()).decode("ascii")
-
-    return data_uri, [[lat_min_img, lon_min_img], [lat_max_img, lon_max_img]]
+    return _reprojeta_para_png_wgs84(array_nativo, transform_nativo, raster_crs, n_bandas)
 
 class PDFRelatorio(FPDF):
     def __init__(self, logo_empresa=None, logo_programa=None):
@@ -1288,33 +1337,51 @@ if condicao_passo5:
                 # que dar zoom com o mouse nunca dispare um rerun/remonte do mapa
                 # por conta própria: enquanto o usuário só navega no mapa já
                 # carregado, o zoom fica 100% em controle dele, sem "voltar"
-                # sozinho. A vista só é recalculada quando o ponto muda.
-                #
-                # (Botão "Vista Geral" removido: ele exigia trocar os bounds
-                # da imagem sem remontar o mapa, e o streamlit-folium mantinha
-                # o pan/zoom da vista anterior por baixo da imagem nova —
-                # aparecendo como um "deslocamento". Sem necessidade real do
-                # recurso, a forma mais robusta de eliminar esse problema foi
-                # remover o botão, não tentar sincronizar os dois estados.)
-                ZOOM_DETALHE_MAPA = 20   # zoom inicial do mapa (o usuário controla o resto com o mouse)
+                # sozinho. A vista só é recalculada quando o ponto muda ou o
+                # usuário clica em "Vista Geral".
+                ZOOM_DETALHE_MAPA = 20   # zoom inicial do recorte de detalhe
 
                 imagem_cache = st.session_state.get(chave_imagem_recortada)
-                ponto_mudou = (
+                # Raster "novo" (primeira vez que essa ortofoto é exibida
+                # nesta sessão — inclui importar um projeto JSON já com
+                # pontos) abre em Vista Geral, para o usuário se localizar
+                # antes de ir para o detalhe de cada ponto. Trocar de ponto
+                # (Anterior/Próximo/seleção) continua indo direto pro detalhe.
+                raster_novo = (
                     imagem_cache is None
                     or imagem_cache.get("raster_id") != identificador_raster
-                    or imagem_cache.get("ponto") != ponto_escolhido
                 )
+                ponto_mudou = raster_novo or imagem_cache.get("ponto") != ponto_escolhido
+                if raster_novo:
+                    nivel_atual = "geral"
+                elif ponto_mudou:
+                    nivel_atual = "ponto"
+                else:
+                    nivel_atual = imagem_cache.get("nivel", "ponto")
 
-                # A imagem recortada só é regerada quando o ponto muda — nunca
-                # sozinha por causa de pan/zoom, para manter previsível o custo
-                # de processamento em rasters de vários GB.
-                if ponto_mudou:
+                vista_geral_clicado = st.button(
+                    "🌍 Vista Geral",
+                    use_container_width=True,
+                    help="Mostra a ortofoto inteira (em baixa resolução), para você se localizar."
+                )
+                if vista_geral_clicado:
+                    nivel_atual = "geral"
+
+                # A imagem recortada só é regerada quando há um motivo
+                # explícito: o ponto mudou, ou "Vista Geral" foi clicado —
+                # nunca sozinha por causa de pan/zoom, para manter previsível
+                # o custo de processamento em rasters de vários GB.
+                if ponto_mudou or vista_geral_clicado:
                     with st.spinner("Recortando a ortofoto..."):
                         try:
-                            imagem_uri, bounds_img = gera_overlay_ortofoto(caminho_raster, lat_centro, lon_centro)
+                            if nivel_atual == "geral":
+                                imagem_uri, bounds_img = gera_overlay_ortofoto_geral(caminho_raster)
+                            else:
+                                imagem_uri, bounds_img = gera_overlay_ortofoto(caminho_raster, lat_centro, lon_centro)
                             imagem_cache = {
                                 "raster_id": identificador_raster,
                                 "ponto": ponto_escolhido,
+                                "nivel": nivel_atual,
                                 "imagem": imagem_uri,
                                 "bounds_img": bounds_img,
                             }
@@ -1394,10 +1461,16 @@ if condicao_passo5:
                     mapa,
                     width=1100,
                     height=550,
-                    # A key muda só quando o ponto muda (não a cada rerun),
-                    # para o streamlit-folium manter o pan/zoom que o usuário
-                    # já deu com o mouse em vez de remontar o mapa sozinho.
-                    key=f"mapa_ortofoto_{st.session_state.reset_key}_{ponto_escolhido}",
+                    # A key muda só quando o ponto ou o nível (geral/detalhe)
+                    # mudam — não a cada rerun — para o streamlit-folium
+                    # manter o pan/zoom que o usuário já deu com o mouse em
+                    # vez de remontar o mapa sozinho. nivel_atual PRECISA
+                    # estar na key: sem isso, ao trocar de nível o componente
+                    # manteria o pan/zoom da vista anterior por baixo da
+                    # imagem nova (bounds bem diferentes), parecendo um
+                    # "deslocamento" mesmo com a imagem georreferenciada
+                    # corretamente.
+                    key=f"mapa_ortofoto_{st.session_state.reset_key}_{ponto_escolhido}_{nivel_atual}",
                     returned_objects=["last_clicked"]
                 )
 
