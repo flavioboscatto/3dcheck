@@ -1350,12 +1350,23 @@ if condicao_passo5:
                 ZOOM_DETALHE_MAPA = 22   # visão nítida usada sempre que o ponto muda
 
                 imagem_cache = st.session_state.get(chave_imagem_recortada)
-                ponto_mudou = (
+                # Raster "novo" (primeira vez que essa ortofoto é exibida nesta
+                # sessão — inclui o caso de importar um projeto JSON já com
+                # pontos marcados) abre em Vista Geral, para o usuário se
+                # localizar antes de ir para o detalhe de cada ponto. Trocar
+                # de ponto (Anterior/Próximo/seleção) continua indo direto
+                # para o detalhe, como antes.
+                raster_novo = (
                     imagem_cache is None
                     or imagem_cache.get("raster_id") != identificador_raster
-                    or imagem_cache.get("ponto") != ponto_escolhido
                 )
-                nivel_atual = "ponto" if ponto_mudou else imagem_cache.get("nivel", "ponto")
+                ponto_mudou = raster_novo or imagem_cache.get("ponto") != ponto_escolhido
+                if raster_novo:
+                    nivel_atual = "geral"
+                elif ponto_mudou:
+                    nivel_atual = "ponto"
+                else:
+                    nivel_atual = imagem_cache.get("nivel", "ponto")
 
                 vista_geral_clicado = st.button(
                     "🌍 Vista Geral",
@@ -1466,7 +1477,16 @@ if condicao_passo5:
                     mapa,
                     width=1100,
                     height=550,
-                    key=f"mapa_ortofoto_{st.session_state.reset_key}_{ponto_escolhido}",
+                    # nivel_atual faz parte da key de propósito: quando "Vista
+                    # Geral" alterna o nível de zoom, o mapa PRECISA remontar
+                    # (senão o streamlit-folium mantém o pan/zoom antigo do
+                    # componente anterior e a imagem nova — com bounds bem
+                    # diferentes — aparece "deslocada" em relação aos
+                    # marcadores, mesmo estando georreferenciada corretamente).
+                    # Sem mudar de nível (só navegando/dando zoom com o
+                    # mouse), a key não muda, então o pan/zoom do usuário
+                    # continua preservado entre reruns.
+                    key=f"mapa_ortofoto_{st.session_state.reset_key}_{ponto_escolhido}_{nivel_atual}",
                     returned_objects=["last_clicked"]
                 )
 
