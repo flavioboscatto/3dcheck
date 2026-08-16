@@ -18,6 +18,8 @@ import re
 import io
 import base64
 import math
+import time
+import shutil
 from fpdf import FPDF
 
 # Dependências específicas do Controle Planimétrico 2D (Ortofoto).
@@ -37,14 +39,55 @@ except Exception as _e_import_ortofoto:
 # FUNÇÕES AUXILIARES E CLASSES
 # ==========================================
 def limpa_texto(texto):
-    """Remove acentos para evitar erros de fonte no FPDF"""
+    """Remove acentos para evitar erros de fonte no FPDF.
+
+    As fontes-núcleo do PDF (Arial/Helvetica) só aceitam latin-1. A
+    normalização NFD resolve os acentos (á -> a), mas NÃO resolve caracteres
+    que não são decomponíveis e também não existem em latin-1 — travessão
+    (–), aspas curvas (" "), ≥, emojis etc. Esses chegam com frequência via
+    copiar-e-colar do Word para os campos do Passo 1 e quebravam a geração do
+    PDF com UnicodeEncodeError. O encode/decode final com 'replace' garante
+    que qualquer caractere restante vire '?' em vez de derrubar o relatório."""
     if not isinstance(texto, str): return str(texto)
-    return ''.join(c for c in unicodedata.normalize('NFD', texto) if unicodedata.category(c) != 'Mn')
+    sem_acento = ''.join(c for c in unicodedata.normalize('NFD', texto) if unicodedata.category(c) != 'Mn')
+    return sem_acento.encode('latin-1', 'replace').decode('latin-1')
 
 def formata_br(valor, casas=3):
     """Formata números para 'n' casas decimais com vírgula"""
     if pd.isna(valor): return ""
     return f"{valor:.{casas}f}".replace('.', ',')
+
+def formata_stat(valor, casas=3):
+    """Igual a formata_br, mas para células de ESTATÍSTICA (média/desvio).
+
+    Com um único ponto marcado, o desvio padrão amostral do pandas (ddof=1) é
+    NaN — e uma célula vazia no relatório parece erro de geração. 'n/d' deixa
+    explícito que o valor não é calculável, não que faltou processar."""
+    if pd.isna(valor): return "n/d"
+    return f"{valor:.{casas}f}".replace('.', ',')
+
+def limpa_temporarios_antigos(horas=24):
+    """Remove pastas temporárias de ortofoto/MDE abandonadas por sessões
+    anteriores (o usuário fechou a aba sem clicar em 'Limpar Tudo').
+
+    Cada sessão pode deixar vários GB para trás; sem essa varredura o disco
+    do servidor enche silenciosamente. Só apaga pastas com o prefixo criado
+    pelo próprio app e mais velhas que o limite, para nunca interferir na
+    sessão de outro usuário que esteja trabalhando no momento."""
+    limite = time.time() - horas * 3600
+    try:
+        raiz_tmp = tempfile.gettempdir()
+        for nome in os.listdir(raiz_tmp):
+            if not nome.startswith(("zcheck_ortho_", "zcheck_mde_")):
+                continue
+            caminho = os.path.join(raiz_tmp, nome)
+            try:
+                if os.path.isdir(caminho) and os.path.getmtime(caminho) < limite:
+                    shutil.rmtree(caminho, ignore_errors=True)
+            except Exception:
+                pass
+    except Exception:
+        pass
 
 def dms_to_dd(d, m, s):
     """Converte Grau, Minuto e Segundo para Grau Decimal"""
@@ -137,8 +180,8 @@ def monta_tabela_stats(colunas):
     dados completos (uma coluna por Delta) com duas linhas: Média e Desvio
     Padrão. `colunas` é uma lista de tuplas (nome_da_coluna, média, desvio)."""
     nomes = [c[0] for c in colunas]
-    linha_media = [formata_br(c[1], 3) for c in colunas]
-    linha_desvio = [formata_br(c[2], 3) for c in colunas]
+    linha_media = [formata_stat(c[1], 3) for c in colunas]
+    linha_desvio = [formata_stat(c[2], 3) for c in colunas]
     return pd.DataFrame([linha_media, linha_desvio], columns=nomes, index=["Média", "Desvio Padrão"])
 
 def calcula_flags_objetivo(objetivo):
@@ -293,11 +336,116 @@ def gera_overlay_ortofoto_geral(caminho_raster, max_dim=1500):
 
     return _reprojeta_para_png_wgs84(array_nativo, transform_nativo, raster_crs, n_bandas)
 
+# ------------------------------------------------------------------
+# CABEÇALHOS DE TABELA DO PDF: símbolo Δ e quebra em duas linhas
+# ------------------------------------------------------------------
+# O símbolo Δ (U+0394) não existe em latin-1, que é a codificação das
+# fontes-núcleo do PDF — por isso o relatório escrevia "Delta" por extenso.
+# A saída é a fonte Symbol: ela é uma das 14 fontes-núcleo (não precisa
+# embutir arquivo nenhum) e nela o caractere 'D' corresponde ao glifo Δ —
+# exatamente a mesma técnica usada nos editores de texto. Como a Symbol não
+# tem variante negrito, o Δ sai em peso regular ao lado do texto em bold;
+# para compensar visualmente ele é desenhado um ponto maior que o texto.
+TAMANHO_DELTA_PADRAO = 9
+TAMANHO_TEXTO_PADRAO = 8
+
+def _tem_fonte_symbol(pdf):
+    """Testa uma única vez se a versão instalada do FPDF aceita a fonte
+    Symbol, guardando o resultado no próprio objeto. Se não aceitar, o
+    relatório continua sendo gerado com a palavra 'Delta' (degradação
+    controlada, nunca uma exceção no meio da geração)."""
+    if not hasattr(pdf, "_symbol_ok"):
+        try:
+            pdf.set_font("Symbol", "", 9)
+            pdf._symbol_ok = True
+        except Exception:
+            pdf._symbol_ok = False
+    return pdf._symbol_ok
+
+def escreve_delta(pdf, x, y, largura, altura, sufixo,
+                  tamanho_texto=TAMANHO_TEXTO_PADRAO,
+                  tamanho_delta=TAMANHO_DELTA_PADRAO,
+                  negrito=True, offset_delta=0.3):
+    """Escreve, centralizado na largura dada, o símbolo Δ (fonte Symbol)
+    seguido de `sufixo` (fonte Arial). Não desenha borda — a moldura da
+    célula é responsabilidade de quem chama.
+
+    `offset_delta` desloca o Δ alguns décimos de milímetro para baixo: como
+    ele é desenhado num corpo maior que o do texto, sem esse ajuste a base
+    dos dois ficaria visivelmente desencontrada."""
+    estilo = 'B' if negrito else ''
+    fonte_familia, fonte_estilo, fonte_tamanho = pdf.font_family, pdf.font_style, pdf.font_size_pt
+
+    if _tem_fonte_symbol(pdf):
+        pdf.set_font("Symbol", "", tamanho_delta)
+        largura_delta = pdf.get_string_width("D")
+        pdf.set_font("Arial", estilo, tamanho_texto)
+        largura_sufixo = pdf.get_string_width(limpa_texto(sufixo))
+
+        x_inicial = x + max(0.0, (largura - (largura_delta + largura_sufixo)) / 2.0)
+
+        pdf.set_font("Symbol", "", tamanho_delta)
+        pdf.set_xy(x_inicial, y + offset_delta)
+        pdf.cell(largura_delta, altura, "D", border=0)
+
+        pdf.set_font("Arial", estilo, tamanho_texto)
+        pdf.set_xy(x_inicial + largura_delta, y)
+        pdf.cell(largura_sufixo, altura, limpa_texto(sufixo), border=0)
+    else:
+        texto = limpa_texto("Delta" + sufixo)
+        tamanho = tamanho_texto
+        pdf.set_font("Arial", estilo, tamanho)
+        while tamanho > 4 and pdf.get_string_width(texto) > largura - 1:
+            tamanho -= 0.5
+            pdf.set_font("Arial", estilo, tamanho)
+        pdf.set_xy(x, y)
+        pdf.cell(largura, altura, texto, border=0, align='C')
+
+    pdf.set_font(fonte_familia, fonte_estilo, fonte_tamanho)
+
+def desenha_cabecalho_tabela(pdf, headers, col_widths, altura=10, tamanho=7):
+    """Desenha a linha de títulos das colunas permitindo QUEBRA EM DUAS
+    LINHAS. `pdf.cell()` não quebra nem trunca texto: rótulos como
+    'E(X) (GCP)' em fonte 8 simplesmente transbordavam por cima da célula
+    vizinha — era isso que deixava a primeira linha do relatório 3D apertada.
+
+    Cada item de `headers` é uma tupla de linhas. Cada linha é uma string
+    comum ou a tupla ('delta', sufixo), que renderiza Δ + sufixo."""
+    altura_linha = 3.5
+    x0 = pdf.l_margin
+    y0 = pdf.get_y()
+    x = x0
+
+    for linhas, largura in zip(headers, col_widths):
+        pdf.set_xy(x, y0)
+        pdf.cell(largura, altura, "", border=1)
+
+        y_texto = y0 + (altura - len(linhas) * altura_linha) / 2.0
+        for i, item in enumerate(linhas):
+            y_linha = y_texto + i * altura_linha
+            if isinstance(item, tuple) and item and item[0] == "delta":
+                escreve_delta(pdf, x, y_linha, largura, altura_linha, item[1],
+                              tamanho_texto=tamanho, tamanho_delta=tamanho + 2)
+            else:
+                pdf.set_font("Arial", 'B', tamanho)
+                pdf.set_xy(x, y_linha)
+                pdf.cell(largura, altura_linha, limpa_texto(item), border=0, align='C')
+        x += largura
+
+    pdf.set_xy(x0, y0 + altura)
+
 class PDFRelatorio(FPDF):
     def __init__(self, logo_empresa=None, logo_programa=None):
         super().__init__()
         self.logo_empresa = logo_empresa
         self.logo_programa = logo_programa
+        # Preenchidos por gerar_pdf logo antes do corpo da tabela: permitem
+        # repetir a linha de títulos no topo de cada página nova (antes, a
+        # partir da página 2 as linhas apareciam sem identificação de coluna).
+        self.cabecalho_tabela = None
+        self.larguras_tabela = None
+        self.altura_cabecalho_tabela = 10
+        self.tamanho_cabecalho_tabela = 7
         
     def header(self):
         if self.logo_empresa and os.path.exists(self.logo_empresa):
@@ -314,6 +462,15 @@ class PDFRelatorio(FPDF):
         titulo = titulos_por_modo.get(getattr(self, 'modo_relatorio', None), "Relatorio Comparativo Altimetrico - GCP e Modelo Digital")
         self.cell(0, 10, titulo, ln=True, align='C')
         self.ln(5)
+
+        # Página nova aberta no meio da tabela (quebra automática): repete a
+        # linha de títulos para que as linhas de dados não fiquem órfãs.
+        if self.page_no() > 1 and self.cabecalho_tabela and self.larguras_tabela:
+            desenha_cabecalho_tabela(
+                self, self.cabecalho_tabela, self.larguras_tabela,
+                altura=self.altura_cabecalho_tabela,
+                tamanho=self.tamanho_cabecalho_tabela
+            )
 
     def footer(self):
         self.set_y(-15)
@@ -349,80 +506,134 @@ def gerar_pdf(df, metadados, stats, crs_info, objetivo, logo_empresa_path=None):
 
     def desenha_tabela_stats(colunas):
         """Tabela de estatísticas transposta: uma coluna por Delta, com duas
-        linhas (Media / Desvio Padrao) - mesmo layout usado na tela."""
+        linhas (Media / Desvio Padrao) - mesmo layout usado na tela.
+
+        `colunas` é uma lista de tuplas (sufixo, media, desvio); o titulo de
+        cada coluna sai como o simbolo Δ seguido do sufixo."""
         largura_rotulo = 30
         largura_valor = 26
+        altura = 7
+
+        x0 = pdf.l_margin
+        y0 = pdf.get_y()
         pdf.set_font("Arial", 'B', 9)
-        pdf.cell(largura_rotulo, 7, "", border=1)
-        for nome, _, _ in colunas:
-            pdf.cell(largura_valor, 7, limpa_texto(nome), border=1, align='C')
-        pdf.ln()
+        pdf.cell(largura_rotulo, altura, "", border=1)
+
+        x = x0 + largura_rotulo
+        for sufixo, _, _ in colunas:
+            pdf.set_xy(x, y0)
+            pdf.cell(largura_valor, altura, "", border=1)
+            escreve_delta(pdf, x, y0, largura_valor, altura, sufixo,
+                          tamanho_texto=8, tamanho_delta=10)
+            x += largura_valor
+        pdf.set_xy(x0, y0 + altura)
+
         pdf.set_font("Arial", size=9)
-        pdf.cell(largura_rotulo, 7, "Media (m)", border=1)
+        pdf.cell(largura_rotulo, altura, "Media (m)", border=1)
         for _, media, _ in colunas:
-            pdf.cell(largura_valor, 7, formata_br(media, 3), border=1, align='C')
+            pdf.cell(largura_valor, altura, formata_stat(media, 3), border=1, align='C')
         pdf.ln()
-        pdf.cell(largura_rotulo, 7, "Desvio Padrao (m)", border=1)
+        pdf.cell(largura_rotulo, altura, "Desvio Padrao (m)", border=1)
         for _, _, desvio in colunas:
-            pdf.cell(largura_valor, 7, formata_br(desvio, 3), border=1, align='C')
+            pdf.cell(largura_valor, altura, formata_stat(desvio, 3), border=1, align='C')
         pdf.ln()
+
+    # Convenção de sinal usada em todo o relatório (ver comentário no bloco de
+    # cálculo): valor do GCP menos valor medido. Explicitar isso no documento
+    # evita que dois relatórios emitidos em versões diferentes do programa
+    # sejam lidos como se tivessem a mesma leitura de viés.
+    legenda_convencao = "Convencao de sinal: Delta = valor do GCP - valor medido (foto / modelo)."
+
+    altura_cabecalho = 10
+    tamanho_cabecalho = 7
 
     if objetivo == "Comparar Cotas (Exige Z do GCP)":
         pdf.cell(0, 6, "Estatisticas da Analise:", ln=True)
         pdf.set_font("Arial", size=10)
         pdf.cell(0, 6, f"Quantidade de Pontos Analisados: {stats['qtd']}", ln=True)
-        pdf.cell(0, 6, f"Media da Discrepancia: {formata_br(stats['media'])} m", ln=True)
-        pdf.cell(0, 6, f"Desvio Padrao: {formata_br(stats['desvio'])} m", ln=True)
-        pdf.ln(10)
-        
-        pdf.set_font("Arial", 'B', 10)
+        pdf.cell(0, 6, f"Media da Discrepancia: {formata_stat(stats.get('media'))} m", ln=True)
+        pdf.cell(0, 6, f"Desvio Padrao: {formata_stat(stats.get('desvio'))} m", ln=True)
+        pdf.set_font("Arial", 'I', 8)
+        pdf.cell(0, 5, limpa_texto("Convencao de sinal: Discrepancia = Z do GCP - Z do modelo."), ln=True)
+        pdf.ln(8)
+
         col_widths = [20, 35, 35, 30, 30, 40]
-        headers = ['ID', 'E(X)', 'N(Y)', 'Z (GCP)', 'Z (Modelo)', 'Discrepancia']
+        headers = [('ID',), ('E(X)',), ('N(Y)',), ('Z (GCP)',), ('Z (Modelo)',), ('Discrepancia',)]
+        tamanho_cabecalho = 9
     elif objetivo == "Controle Planimétrico 2D (Exige Ortofoto)":
         pdf.cell(0, 6, "Estatisticas da Analise:", ln=True)
         pdf.set_font("Arial", size=10)
         pdf.cell(0, 6, f"Quantidade de Pontos Verificados: {stats['qtd']}", ln=True)
         pdf.ln(3)
         desenha_tabela_stats([
-            ("Delta E(X)", stats.get('media_x'), stats.get('desvio_x')),
-            ("Delta N(Y)", stats.get('media_y'), stats.get('desvio_y')),
-            ("Delta 2D", stats.get('media_2d'), stats.get('desvio_2d')),
+            (" E(X)", stats.get('media_x'), stats.get('desvio_x')),
+            (" N(Y)", stats.get('media_y'), stats.get('desvio_y')),
+            (" 2D", stats.get('media_2d'), stats.get('desvio_2d')),
         ])
-        pdf.ln(7)
+        pdf.set_font("Arial", 'I', 8)
+        pdf.cell(0, 5, limpa_texto(legenda_convencao), ln=True)
+        pdf.ln(5)
 
-        pdf.set_font("Arial", 'B', 8)
         col_widths = [16, 23, 23, 23, 23, 20, 20, 24]
-        headers = ['ID', 'E(X) (GCP)', 'N(Y) (GCP)', 'E(X) (Foto)', 'N(Y) (Foto)', 'Delta E(X)', 'Delta N(Y)', 'Delta 2D']
+        headers = [
+            ('ID',),
+            ('E(X)', '(GCP)'), ('N(Y)', '(GCP)'),
+            ('E(X)', '(Foto)'), ('N(Y)', '(Foto)'),
+            (('delta', ' E(X)'), '(m)'),
+            (('delta', ' N(Y)'), '(m)'),
+            (('delta', ' 2D'), '(m)'),
+        ]
+        tamanho_cabecalho = 8
     elif objetivo == "Análise 3D (Planimétrico + Altimétrico)":
         pdf.cell(0, 6, "Estatisticas da Analise:", ln=True)
         pdf.set_font("Arial", size=10)
         pdf.cell(0, 6, f"Quantidade de Pontos Analisados: {stats['qtd']}", ln=True)
         pdf.ln(3)
         desenha_tabela_stats([
-            ("Delta E(X)", stats.get('media_x'), stats.get('desvio_x')),
-            ("Delta N(Y)", stats.get('media_y'), stats.get('desvio_y')),
-            ("Delta 2D", stats.get('media_2d'), stats.get('desvio_2d')),
-            ("Delta Z", stats.get('media_z'), stats.get('desvio_z')),
-            ("Delta 3D", stats.get('media_3d'), stats.get('desvio_3d')),
+            (" E(X)", stats.get('media_x'), stats.get('desvio_x')),
+            (" N(Y)", stats.get('media_y'), stats.get('desvio_y')),
+            (" 2D", stats.get('media_2d'), stats.get('desvio_2d')),
+            (" Z", stats.get('media_z'), stats.get('desvio_z')),
+            (" 3D", stats.get('media_3d'), stats.get('desvio_3d')),
         ])
-        pdf.ln(7)
+        pdf.set_font("Arial", 'I', 8)
+        pdf.cell(0, 5, limpa_texto(legenda_convencao), ln=True)
+        pdf.ln(5)
 
-        pdf.set_font("Arial", 'B', 8)
         col_widths = [12, 18, 18, 18, 18, 13, 13, 14, 13, 14, 13, 14]
-        headers = ['ID', 'E(X) (GCP)', 'N(Y) (GCP)', 'E(X) (Foto)', 'N(Y) (Foto)', 'Delta E(X)', 'Delta N(Y)', 'Delta 2D', 'Z (GCP)', 'Z (Modelo)', 'Delta Z', 'Delta 3D']
+        headers = [
+            ('ID',),
+            ('E(X)', '(GCP)'), ('N(Y)', '(GCP)'),
+            ('E(X)', '(Foto)'), ('N(Y)', '(Foto)'),
+            (('delta', ' E(X)'), '(m)'),
+            (('delta', ' N(Y)'), '(m)'),
+            (('delta', ' 2D'), '(m)'),
+            ('Z', '(GCP)'), ('Z', '(Modelo)'),
+            (('delta', ' Z'), '(m)'),
+            (('delta', ' 3D'), '(m)'),
+        ]
+        tamanho_cabecalho = 7
     else:
         pdf.cell(0, 6, "Estatisticas da Analise:", ln=True)
         pdf.set_font("Arial", size=10)
         pdf.cell(0, 6, f"Quantidade de Pontos Extraidos: {stats['qtd']}", ln=True)
         pdf.ln(10)
 
-        pdf.set_font("Arial", 'B', 10)
         col_widths = [30, 45, 45, 40]
-        headers = ['ID', 'E(X)', 'N(Y)', 'Z (Modelo)']
+        headers = [('ID',), ('E(X)',), ('N(Y)',), ('Z (Modelo)',)]
+        tamanho_cabecalho = 9
 
-    for i, header in enumerate(headers):
-        pdf.cell(col_widths[i], 8, header, border=1, align='C')
-    pdf.ln()
+    # Desenha o cabecalho da pagina 1 ANTES de registrar os atributos: assim, se
+    # este desenho por acaso disparar uma quebra de pagina, header() ainda nao
+    # esta armado e nao duplica a linha de titulos.
+    desenha_cabecalho_tabela(pdf, headers, col_widths, altura=altura_cabecalho, tamanho=tamanho_cabecalho)
+
+    # A partir daqui header() repete esta mesma linha de titulos no topo de cada
+    # pagina aberta pela quebra automatica no meio do corpo da tabela.
+    pdf.cabecalho_tabela = headers
+    pdf.larguras_tabela = col_widths
+    pdf.altura_cabecalho_tabela = altura_cabecalho
+    pdf.tamanho_cabecalho_tabela = tamanho_cabecalho
 
     if objetivo == "Controle Planimétrico 2D (Exige Ortofoto)":
         pdf.set_font("Arial", size=8)
@@ -453,6 +664,10 @@ def gerar_pdf(df, metadados, stats, crs_info, objetivo, logo_empresa_path=None):
                 pdf.cell(col_widths[4], 8, formata_br(row.iloc[4], 3), border=1, align='C')
                 pdf.cell(col_widths[5], 8, formata_br(row.iloc[5], 3), border=1, align='C')
             pdf.ln()
+
+    # Fim da tabela: nenhuma pagina aberta a partir daqui deve repetir titulos.
+    pdf.cabecalho_tabela = None
+    pdf.larguras_tabela = None
 
     saida_pdf = pdf.output()
     return bytes(saida_pdf) if isinstance(saida_pdf, (bytes, bytearray)) else saida_pdf.encode('latin-1')
@@ -490,6 +705,12 @@ st.markdown("""
 if 'reset_key' not in st.session_state:
     st.session_state.reset_key = 0
 
+# Uma única varredura por sessão: apaga ortofotos/MDEs temporários deixados
+# por sessões anteriores encerradas sem o botão "Limpar Tudo" (aba fechada).
+if 'limpeza_tmp_feita' not in st.session_state:
+    limpa_temporarios_antigos(horas=24)
+    st.session_state['limpeza_tmp_feita'] = True
+
 # Aplica dados de um JSON recém-carregado ANTES dos widgets serem instanciados
 # (não é permitido alterar st.session_state de um widget depois que ele já existe)
 if 'pending_json' in st.session_state:
@@ -510,6 +731,15 @@ if 'pending_json' in st.session_state:
     st.session_state[f"obj_{rk}"] = _cfg.get("objetivo", "Comparar Cotas (Exige Z do GCP)")
     st.session_state[f"modo_{rk}"] = "Carregar Projeto Salvo (JSON)"
 
+    # As marcações feitas sobre a ortofoto ficam apenas ESTACIONADAS aqui: elas
+    # são gravadas em lat/long (WGS84) e só podem ser convertidas para o
+    # sistema do projeto lá no Passo 5, onde existem o EPSG definitivo e o
+    # transformer. Aplicar agora, com o EPSG "de palpite", reintroduziria
+    # exatamente o erro silencioso que a gravação em WGS84 evita.
+    _marcacoes_json = _dados_pendentes.get("marcacoes_ortofoto") or {}
+    if _marcacoes_json.get("pontos"):
+        st.session_state[f"marcacoes_pendentes_{rk}"] = _marcacoes_json
+
 def limpar_tudo():
     # Remove arquivos temporários de ortofoto e MDE gravados em disco
     for key in list(st.session_state.keys()):
@@ -523,7 +753,16 @@ def limpar_tudo():
                 pass
 
     st.session_state.reset_key += 1
-    prefixos_para_limpar = ('cache_', 'raster_path_', 'raster_id_', 'raster_mde_path_', 'raster_mde_id_', 'imagem_recortada_', 'extensao_raster_', 'epsg_raster_', 'marcacoes_', 'select_ponto_', 'pendente_nav_', 'ultimo_clique_', 'modo_coleta_', 'nivel_manual_')
+    prefixos_para_limpar = (
+        'cache_', 'raster_path_', 'raster_id_', 'raster_mde_path_', 'raster_mde_id_',
+        'imagem_recortada_', 'extensao_raster_', 'epsg_raster_', 'marcacoes_',
+        'select_ponto_', 'pendente_nav_', 'ultimo_clique_', 'modo_coleta_', 'nivel_manual_',
+        # Acrescentados: sem eles, as chaves da sessão anterior continuavam
+        # residentes na memória a cada "Limpar Tudo" (o índice novo isolava o
+        # funcionamento, mas o consumo só crescia em sessões longas).
+        'marcacoes_pendentes_', 'nome_ortofoto_', 'epsg_marcacoes_',
+        '_json_aplicado_', 'df_manual_', 'mostrar_nominal_', 'cache_input_sig_',
+    )
     for key in list(st.session_state.keys()):
         if key.startswith(prefixos_para_limpar):
             del st.session_state[key]
@@ -692,14 +931,19 @@ if modo_importacao == "Carregar Projeto Salvo (JSON)":
 elif modo_importacao == "Importar Planilha SIGEF (.ods)":
     st.info("ℹ️ Lendo planilha SIGEF. As coordenadas da aba 'Perímetro' são sempre Geodésicas e serão convertidas para Graus Decimais (DD).")
     
-    if modo_3d:
-        st.warning("⚠️ A planilha SIGEF não traz cota Z do GCP; a análise seguirá apenas como 'Controle Planimétrico 2D'.")
-        objetivo = "Controle Planimétrico 2D (Exige Ortofoto)"
+    # A planilha SIGEF traz as coordenadas do memorial descritivo do imóvel:
+    # são os vértices declarados do perímetro, não pontos de controle medidos
+    # em campo para checagem. Ela não serve, portanto, como referência de
+    # verificação posicional — nem planimétrica nem altimétrica. Este modo de
+    # importação fica amarrado exclusivamente à extração de Z do modelo.
+    if objetivo != "Apenas Extrair Z do Modelo":
+        st.warning(
+            "⚠️ A planilha SIGEF traz vértices do memorial descritivo, que não são pontos de "
+            "controle de campo — ela não serve como referência de checagem posicional. "
+            "O modo de processamento foi ajustado para **'Apenas Extrair Z do Modelo'**."
+        )
+        objetivo = "Apenas Extrair Z do Modelo"
         modo_3d, modo_planimetrico, usa_ortofoto, exige_z_gcp, usa_mde = calcula_flags_objetivo(objetivo)
-    elif exige_z_gcp:
-         st.warning("⚠️ O modo de processamento foi forçado para 'Apenas Extrair Z do Modelo' conforme padrão de extração SIGEF.")
-         objetivo = "Apenas Extrair Z do Modelo"
-         modo_3d, modo_planimetrico, usa_ortofoto, exige_z_gcp, usa_mde = calcula_flags_objetivo(objetivo)
 
     uploaded_file = st.file_uploader("Selecione a planilha SIGEF (.ods)", type=["ods"], key=f"file_sigef_{st.session_state.reset_key}")
     
@@ -973,7 +1217,64 @@ elif modo_importacao == "Digitar Dados Manualmente":
 # pois também guarda a configuração dos Passos 1 e 2 (metadados, datum, fuso etc.)
 # ==========================================
 st.write("")
+
+def monta_bloco_marcacoes():
+    """Prepara, para gravação no JSON, os pontos já marcados sobre a ortofoto.
+
+    As marcações vivem em st.session_state no sistema do projeto (x/y), mas são
+    gravadas em LAT/LONG (WGS84) como fonte de verdade. Motivo: se o arquivo
+    for reaberto com outro Fuso/Datum no Passo 2, coordenadas projetadas
+    voltariam deslocadas dezenas de metros sem qualquer aviso; lat/long é
+    independente dessa configuração e é reprojetada na leitura para o EPSG que
+    estiver valendo. O x/y segue junto apenas como redundância auditável.
+
+    Observação sobre ordem de execução: este bloco é renderizado ANTES do
+    Passo 5, mas toda marcação e toda remoção terminam em st.rerun() — logo, no
+    rerun seguinte o session_state já está atualizado quando chegamos aqui.
+    """
+    rk = st.session_state.reset_key
+    marcacoes_atuais = st.session_state.get(f"marcacoes_{rk}") or {}
+
+    if not marcacoes_atuais:
+        # JSON carregado mas ortofoto ainda não reenviada: as marcações estão
+        # apenas estacionadas (não puderam ser reprojetadas ainda). Repassa o
+        # bloco original para o novo arquivo — sem isso, salvar o projeto nesse
+        # meio do caminho apagaria silenciosamente todo o trabalho de marcação.
+        return st.session_state.get(f"marcacoes_pendentes_{rk}")
+
+    epsg_marcacoes = st.session_state.get(f"epsg_marcacoes_{rk}")
+    pontos_gravar = {}
+
+    transformer_saida = None
+    if epsg_marcacoes is not None and LIBS_ORTOFOTO_OK:
+        try:
+            transformer_saida = Transformer.from_crs(f"EPSG:{epsg_marcacoes}", "EPSG:4326", always_xy=True)
+        except Exception:
+            transformer_saida = None
+
+    for pid, coord in marcacoes_atuais.items():
+        registro = {"x": coord.get("x"), "y": coord.get("y")}
+        if transformer_saida is not None:
+            try:
+                lon_pt, lat_pt = transformer_saida.transform(coord["x"], coord["y"])
+                registro["lat"] = lat_pt
+                registro["lon"] = lon_pt
+            except Exception:
+                pass
+        pontos_gravar[str(pid)] = registro
+
+    return {
+        "epsg_projeto_original": epsg_marcacoes,
+        "crs_armazenamento": "EPSG:4326",
+        "ortofoto_referencia": st.session_state.get(f"nome_ortofoto_{rk}"),
+        "objetivo": objetivo,
+        "pontos": pontos_gravar,
+    }
+
+bloco_marcacoes = monta_bloco_marcacoes()
+
 dados_json_salvar = {
+    "versao_formato": 2,
     "metadados": dicionario_metadados,
     "configuracao_src": {
         "datum": datum,
@@ -991,6 +1292,9 @@ dados_json_salvar = {
     },
     "dados_pontos": json.loads(df_pontos.to_json(orient="records")) if df_pontos is not None else []
 }
+if bloco_marcacoes is not None:
+    dados_json_salvar["marcacoes_ortofoto"] = bloco_marcacoes
+
 json_string_salvar = json.dumps(dados_json_salvar, indent=4, ensure_ascii=False)
 
 st.download_button(
@@ -999,8 +1303,11 @@ st.download_button(
     file_name="3DCheck_Projeto.json",
     mime="application/json",
     key=f"btn_json_salvar_{st.session_state.reset_key}",
-    help="Salva metadados, configuração e (se já importados) os pontos e o mapeamento de colunas. Ortofoto/MDE não são salvos aqui."
+    help="Salva metadados, configuração, os pontos, o mapeamento de colunas e as marcações já feitas sobre a ortofoto. As imagens (ortofoto/MDE) não são salvas aqui."
 )
+
+if bloco_marcacoes is not None:
+    st.caption(f"💾 O JSON inclui {len(bloco_marcacoes['pontos'])} marcação(ões) já feita(s) sobre a ortofoto.")
 
 # ==========================================
 # PASSO 4: Importação do Modelo (TIFF) / Ortofoto
@@ -1020,7 +1327,10 @@ elif modo_planimetrico:
     st.header("4. Importação da Ortofoto — 10GB max.")
     uploaded_tiff = st.file_uploader("Arraste ou selecione sua ortofoto georreferenciada", type=["tif", "tiff"], key=f"file_tif_{st.session_state.reset_key}")
 else:
-    st.header("4. Importação do Modelo (TIFF) — 10GB max.")
+    # Sem "10GB max." aqui de propósito: neste fluxo o modelo ainda é aberto via
+    # MemoryFile (leitura integral em RAM), então o teto real é a memória da
+    # máquina, não o limite de upload. Ver item 5.1 do plano — mantido como está.
+    st.header("4. Importação do Modelo (TIFF)")
     uploaded_tiff = st.file_uploader("Arraste ou selecione seu MDE/MDS georreferenciado", type=["tif", "tiff"], key=f"file_tif_{st.session_state.reset_key}")
 
 # ==========================================
@@ -1090,11 +1400,40 @@ if condicao_passo5:
                 st.stop()
 
             col_z_para_limpeza = col_z_val if (exige_z_gcp and col_z_val is not None) else None
+
+            # Limpeza em dois estágios só para conseguir DIZER ao usuário por que
+            # um ponto sumiu: antes, um GCP sem Z (ou com coordenada inválida)
+            # era descartado em silêncio e simplesmente não aparecia no relatório.
+            df_so_coords = limpa_coords_numericas(df_pontos, col_x_val, col_y_val, None)
             df_calc = limpa_coords_numericas(df_pontos, col_x_val, col_y_val, col_z_para_limpeza).reset_index(drop=True)
+
+            descartados_coord = len(df_pontos) - len(df_so_coords)
+            descartados_z = len(df_so_coords) - len(df_calc)
+            if descartados_coord > 0:
+                st.warning(f"⚠️ {descartados_coord} ponto(s) descartado(s): coordenada E(X)/N(Y) vazia ou não numérica.")
+            if descartados_z > 0:
+                st.warning(
+                    f"⚠️ {descartados_z} ponto(s) descartado(s) por **não possuir cota Z do GCP** "
+                    "(a Análise 3D exige Z de campo). Confira a coluna Z no mapeamento do Passo 3."
+                )
 
             if df_calc.empty:
                 st.error("Nenhum ponto com coordenadas válidas foi encontrado para marcação.")
                 st.stop()
+
+            # IDs repetidos: 'marcacoes' é indexado pelo nome do ponto, então dois
+            # pontos homônimos compartilhariam a MESMA marcação — a segunda
+            # sobrescreve a primeira e um deles fica fora do relatório. Aqui só
+            # avisamos (nada é alterado na importação, que é a parte delicada).
+            ids_repetidos = df_calc[col_id].astype(str).value_counts()
+            ids_repetidos = ids_repetidos[ids_repetidos > 1]
+            if not ids_repetidos.empty:
+                st.warning(
+                    "⚠️ **IDs repetidos na lista de pontos:** "
+                    + ", ".join(f"{pid} ({qtd}x)" for pid, qtd in ids_repetidos.items())
+                    + ". Cada nome admite uma única marcação — pontos homônimos vão compartilhar "
+                    "a mesma posição marcada. Renomeie-os no arquivo de origem para checar todos."
+                )
 
             # --- Grava a ortofoto em disco (nunca em memória: arquivos podem ter vários GB) ---
             chave_raster_path = f"raster_path_{st.session_state.reset_key}"
@@ -1130,6 +1469,9 @@ if condicao_passo5:
 
                 st.session_state[chave_raster_path] = caminho_raster
                 st.session_state[chave_raster_id] = identificador_raster
+                # Guardado para o JSON conseguir registrar sobre QUAL ortofoto as
+                # marcações foram feitas (o bloco de gravação roda antes do Passo 4).
+                st.session_state[f"nome_ortofoto_{st.session_state.reset_key}"] = uploaded_tiff.name
                 # Nova ortofoto: descarta imagem/extensão/CRS da ortofoto anterior.
                 st.session_state.pop(chave_imagem_recortada, None)
                 st.session_state.pop(chave_extensao_raster, None)
@@ -1229,11 +1571,96 @@ if condicao_passo5:
                 transformer_para_wgs84 = Transformer.from_crs(f"EPSG:{epsg_code}", "EPSG:4326", always_xy=True)
                 transformer_de_wgs84 = Transformer.from_crs("EPSG:4326", f"EPSG:{epsg_code}", always_xy=True)
 
+                # EPSG em que as marcações desta sessão estão sendo armazenadas —
+                # lido pelo bloco de gravação do JSON para convertê-las a WGS84.
+                st.session_state[f"epsg_marcacoes_{st.session_state.reset_key}"] = epsg_code
+
+                # --- Restauração das marcações vindas de um JSON carregado ---
+                # Só acontece uma vez (pop): daqui em diante o dicionário de
+                # marcações da sessão passa a ser a única fonte de verdade.
+                chave_marcacoes_pendentes = f"marcacoes_pendentes_{st.session_state.reset_key}"
+                if chave_marcacoes_pendentes in st.session_state:
+                    bloco_restaurar = st.session_state.pop(chave_marcacoes_pendentes) or {}
+                    pontos_restaurar = bloco_restaurar.get("pontos", {}) or {}
+
+                    restaurados = 0
+                    ids_desconhecidos = []
+                    sem_coordenada = 0
+                    conjunto_ids = set(lista_ids)
+
+                    for pid_json, coord_json in pontos_restaurar.items():
+                        pid_json = str(pid_json)
+                        if pid_json not in conjunto_ids:
+                            ids_desconhecidos.append(pid_json)
+                            continue
+                        # Marcação feita nesta sessão tem prioridade sobre a do arquivo.
+                        if pid_json in marcacoes:
+                            continue
+
+                        lat_json = coord_json.get("lat")
+                        lon_json = coord_json.get("lon")
+                        try:
+                            if lat_json is not None and lon_json is not None:
+                                x_rest, y_rest = transformer_de_wgs84.transform(float(lon_json), float(lat_json))
+                            elif coord_json.get("x") is not None and coord_json.get("y") is not None:
+                                # JSON antigo/parcial, sem lat/long: aceita x/y apenas se o
+                                # EPSG do projeto for o mesmo com que foram gravados —
+                                # caso contrário o ponto voltaria deslocado sem aviso.
+                                if bloco_restaurar.get("epsg_projeto_original") != epsg_code:
+                                    sem_coordenada += 1
+                                    continue
+                                x_rest, y_rest = float(coord_json["x"]), float(coord_json["y"])
+                            else:
+                                sem_coordenada += 1
+                                continue
+                        except Exception:
+                            sem_coordenada += 1
+                            continue
+
+                        marcacoes[pid_json] = {"x": x_rest, "y": y_rest}
+                        restaurados += 1
+
+                    if restaurados:
+                        st.session_state[chave_marcacoes] = marcacoes
+                        st.success(f"✅ {restaurados} marcação(ões) restaurada(s) do projeto salvo.")
+
+                    if ids_desconhecidos:
+                        st.warning(
+                            f"⚠️ {len(ids_desconhecidos)} marcação(ões) do JSON não correspondem a nenhum ID "
+                            f"da lista de pontos atual e foram ignoradas: {', '.join(ids_desconhecidos[:10])}"
+                            + ("..." if len(ids_desconhecidos) > 10 else "")
+                        )
+                    if sem_coordenada:
+                        st.warning(
+                            f"⚠️ {sem_coordenada} marcação(ões) do JSON não puderam ser reprojetadas para o "
+                            "sistema de coordenadas atual (Passo 2) e foram ignoradas."
+                        )
+
+                    nome_orto_json = bloco_restaurar.get("ortofoto_referencia")
+                    if restaurados and nome_orto_json and nome_orto_json != uploaded_tiff.name:
+                        st.info(
+                            f"ℹ️ As marcações restauradas foram feitas sobre a ortofoto **{nome_orto_json}**, "
+                            f"e a ortofoto carregada agora é **{uploaded_tiff.name}**. "
+                            "Confira visualmente antes de calcular."
+                        )
+
                 qtd_marcados = len(marcacoes)
                 st.progress(qtd_marcados / len(lista_ids) if lista_ids else 0)
                 st.caption(f"{qtd_marcados} de {len(lista_ids)} pontos marcados.")
 
-                col_nav1, col_nav2, col_nav3, col_nav4 = st.columns([2, 1, 1, 1])
+                # A última coluna é um ESPAÇADOR vazio: sem ela, as quatro
+                # colunas dividiriam entre si os 100% da largura e o selectbox
+                # continuaria largo por mais que se mexesse nas proporções.
+                # vertical_alignment alinha os botões (sem rótulo) à base do
+                # selectbox (que tem rótulo) — requer Streamlit >= 1.36.
+                try:
+                    col_nav1, col_nav2, col_nav3, col_nav4, _col_nav_espaco = st.columns(
+                        [1.4, 0.9, 0.9, 1.0, 4.8], vertical_alignment="bottom"
+                    )
+                except TypeError:
+                    col_nav1, col_nav2, col_nav3, col_nav4, _col_nav_espaco = st.columns(
+                        [1.4, 0.9, 0.9, 1.0, 4.8]
+                    )
                 with col_nav1:
                     ponto_escolhido = st.selectbox(
                         "Ponto atual:",
@@ -1251,7 +1678,7 @@ if condicao_passo5:
                         st.session_state[chave_pendente_nav] = lista_ids[min(len(lista_ids) - 1, idx_atual + 1)]
                         st.rerun()
                 with col_nav4:
-                    if st.button("🗑️ Remover Marcação", use_container_width=True, disabled=(ponto_escolhido not in marcacoes)):
+                    if st.button("🗑️ Remover", use_container_width=True, disabled=(ponto_escolhido not in marcacoes), help="Remove a marcação do ponto atual."):
                         marcacoes.pop(ponto_escolhido, None)
                         st.rerun()
 
@@ -1512,17 +1939,23 @@ if condicao_passo5:
                         x_foto = marcacoes[pid]['x']
                         y_foto = marcacoes[pid]['y']
 
+                        # CONVENÇÃO DE SINAL (única em todo o programa):
+                        #     Delta = valor do GCP - valor medido (foto ou modelo).
+                        # Antes, a planimetria usava foto - GCP enquanto a altimetria
+                        # usava GCP - modelo: dentro do MESMO relatório 3D a média de
+                        # Delta Z saía com sinal oposto ao das médias de Delta E/N, o
+                        # que inverte a leitura da tendência (viés) do produto.
                         if tipo_calc == "UTM":
-                            erro_x_m = x_foto - x_gcp
-                            erro_y_m = y_foto - y_gcp
+                            erro_x_m = x_gcp - x_foto
+                            erro_y_m = y_gcp - y_foto
                         else:
                             # Coordenadas em graus decimais: converte a diferença angular
                             # para metros usando uma aproximação local (equiretangular),
                             # válida para as distâncias curtas envolvidas num GCP de checagem.
                             metros_por_grau_lat = 111320.0
                             metros_por_grau_lon = 111320.0 * math.cos(math.radians(y_gcp))
-                            erro_x_m = (x_foto - x_gcp) * metros_por_grau_lon
-                            erro_y_m = (y_foto - y_gcp) * metros_por_grau_lat
+                            erro_x_m = (x_gcp - x_foto) * metros_por_grau_lon
+                            erro_y_m = (y_gcp - y_foto) * metros_por_grau_lat
 
                         erro_plan = math.sqrt(erro_x_m ** 2 + erro_y_m ** 2)
 
@@ -1555,6 +1988,25 @@ if condicao_passo5:
                             z_modelo = [val[0] for val in raster_mde.sample(coordenadas_mde)]
 
                         resultado_final['Z (Modelo)'] = z_modelo
+
+                        # NoData (ponto fora da área do modelo ou sobre pixel sem
+                        # dado) chega como um valor sentinela do tipo -32767. Um
+                        # único ponto desses destruiria a média e o desvio padrão
+                        # do relatório, por isso ele é REMOVIDO do cálculo — e o
+                        # usuário é avisado de quais pontos saíram.
+                        mascara_nodata = resultado_final['Z (Modelo)'] < -10000
+                        if mascara_nodata.any():
+                            ids_nodata = resultado_final.loc[mascara_nodata, 'ID do Ponto'].astype(str).tolist()
+                            resultado_final = resultado_final[~mascara_nodata].reset_index(drop=True)
+                            st.warning(
+                                f"⚠️ {len(ids_nodata)} ponto(s) removido(s) do cálculo por não terem cota "
+                                f"válida no modelo (NoData / fora da área): {', '.join(ids_nodata)}."
+                            )
+
+                        if resultado_final.empty:
+                            st.error("Nenhum ponto restou após a remoção dos valores NoData do modelo.")
+                            st.stop()
+
                         resultado_final['Δ Z (m)'] = resultado_final['Z (GCP)'] - resultado_final['Z (Modelo)']
                         # Delta 3D por Pitágoras: catetos Delta 2D (planimétrico) e Delta Z (altimétrico).
                         resultado_final['Δ 3D (m)'] = (resultado_final['Δ 2D (m)'] ** 2 + resultado_final['Δ Z (m)'] ** 2) ** 0.5
@@ -1589,7 +2041,22 @@ if condicao_passo5:
                     epsg_code = determinar_epsg(tipo_calc, datum, fuso, hemisferio)
 
                     col_z_para_limpeza = col_z_val if (exige_z_gcp and col_z_val is not None) else None
+
+                    df_so_coords = limpa_coords_numericas(df_pontos, col_x_val, col_y_val, None)
                     df_calc = limpa_coords_numericas(df_pontos, col_x_val, col_y_val, col_z_para_limpeza)
+
+                    descartados_coord = len(df_pontos) - len(df_so_coords)
+                    descartados_z = len(df_so_coords) - len(df_calc)
+                    if descartados_coord > 0:
+                        st.warning(f"⚠️ {descartados_coord} ponto(s) descartado(s): coordenada E(X)/N(Y) vazia ou não numérica.")
+                    if descartados_z > 0:
+                        st.warning(
+                            f"⚠️ {descartados_z} ponto(s) descartado(s) por **não possuir cota Z do GCP** "
+                            "(este modo exige Z de campo). Confira a coluna Z no mapeamento do Passo 3."
+                        )
+                    if df_calc.empty:
+                        st.error("Nenhum ponto com coordenadas válidas foi encontrado para processar.")
+                        st.stop()
 
                     geometria = [Point(xy) for xy in zip(df_calc[col_x_val], df_calc[col_y_val])]
                     gdf = gpd.GeoDataFrame(df_calc, geometry=geometria, crs=f"EPSG:{epsg_code}")
@@ -1608,6 +2075,22 @@ if condicao_passo5:
                     gdf['Z_Modelo'] = z_modelo
 
                     if objetivo == "Comparar Cotas (Exige Z do GCP)":
+                        # Mesma regra do modo 3D: NoData contamina média e desvio
+                        # padrão, então sai do cálculo com aviso. No modo "Apenas
+                        # Extrair Z do Modelo" NÃO se remove nada — ali não há
+                        # estatística e o usuário quer ver o valor bruto extraído.
+                        mascara_nodata_alt = gdf['Z_Modelo'] < -10000
+                        if mascara_nodata_alt.any():
+                            ids_nodata_alt = gdf.loc[mascara_nodata_alt, col_id].astype(str).tolist()
+                            gdf = gdf[~mascara_nodata_alt].copy()
+                            st.warning(
+                                f"⚠️ {len(ids_nodata_alt)} ponto(s) removido(s) do cálculo por não terem cota "
+                                f"válida no modelo (NoData / fora da área): {', '.join(ids_nodata_alt)}."
+                            )
+                        if gdf.empty:
+                            st.error("Nenhum ponto restou após a remoção dos valores NoData do modelo.")
+                            st.stop()
+
                         gdf['Erro_Z'] = gdf[col_z_val] - gdf['Z_Modelo']
                         resultado_final = gdf[[col_id, col_x_val, col_y_val, col_z_val, 'Z_Modelo', 'Erro_Z']].copy()
                         resultado_final.columns = ['ID do Ponto', 'E(X)', 'N(Y)', 'Z (GCP)', 'Z (Modelo)', 'Discrepância']
@@ -1673,7 +2156,7 @@ if condicao_passo5:
                 for col in ['Δ E(X) (m)', 'Δ N(Y) (m)', 'Δ 2D (m)', 'Z (GCP)', 'Z (Modelo)', 'Δ Z (m)', 'Δ 3D (m)']:
                     df_exibicao[col] = df_exibicao[col].apply(lambda x: formata_br(x, 3))
 
-                st.caption("As colunas E(X)/N(Y) estão no sistema de coordenadas do projeto (graus ou metros, conforme o Passo 2). As colunas de Delta são sempre expressas em metros.")
+                st.caption("As colunas E(X)/N(Y) estão no sistema de coordenadas do projeto (graus ou metros, conforme o Passo 2). As colunas de Delta são sempre expressas em metros. Convenção de sinal: Δ = valor do GCP − valor medido (foto / modelo).")
 
                 st.metric("Quantidade de Pontos", stats_dict["qtd"])
 
@@ -1697,7 +2180,7 @@ if condicao_passo5:
                 for col in ['Δ E(X) (m)', 'Δ N(Y) (m)', 'Δ 2D (m)']:
                     df_exibicao[col] = df_exibicao[col].apply(lambda x: formata_br(x, 3))
 
-                st.caption("As colunas E(X)/N(Y) estão no sistema de coordenadas do projeto (graus ou metros, conforme o Passo 2). As colunas de Delta são sempre expressas em metros.")
+                st.caption("As colunas E(X)/N(Y) estão no sistema de coordenadas do projeto (graus ou metros, conforme o Passo 2). As colunas de Delta são sempre expressas em metros. Convenção de sinal: Δ = valor do GCP − valor medido (foto / modelo).")
 
                 st.metric("Quantidade de Pontos", stats_dict["qtd"])
 
@@ -1719,10 +2202,12 @@ if condicao_passo5:
                     for col in ['Z (GCP)', 'Z (Modelo)', 'Discrepância']:
                         df_exibicao[col] = df_exibicao[col].apply(lambda x: formata_br(x, 3))
 
+                    st.caption("Convenção de sinal: Discrepância = Z do GCP − Z do modelo.")
+
                     col_stat1, col_stat2, col_stat3 = st.columns(3)
                     col_stat1.metric("Quantidade de Pontos", stats_dict["qtd"])
-                    col_stat2.metric("Média da Discrepância", f"{formata_br(stats_dict['media'], 3)} m")
-                    col_stat3.metric("Desvio Padrão", f"{formata_br(stats_dict['desvio'], 3)} m")
+                    col_stat2.metric("Média da Discrepância", f"{formata_stat(stats_dict['media'], 3)} m")
+                    col_stat3.metric("Desvio Padrão", f"{formata_stat(stats_dict['desvio'], 3)} m")
                 else:
                     for col in ['E(X)', 'N(Y)']:
                         df_exibicao[col] = df_exibicao[col].apply(lambda x: formata_br(x, casas_coord))
