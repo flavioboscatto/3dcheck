@@ -489,7 +489,7 @@ def limpar_tudo():
                 pass
 
     st.session_state.reset_key += 1
-    prefixos_para_limpar = ('cache_', 'raster_path_', 'raster_id_', 'raster_mde_path_', 'raster_mde_id_', 'imagem_recortada_', 'extensao_raster_', 'marcacoes_', 'select_ponto_', 'pendente_nav_', 'ultimo_clique_', 'modo_coleta_')
+    prefixos_para_limpar = ('cache_', 'raster_path_', 'raster_id_', 'raster_mde_path_', 'raster_mde_id_', 'imagem_recortada_', 'extensao_raster_', 'epsg_raster_', 'marcacoes_', 'select_ponto_', 'pendente_nav_', 'ultimo_clique_', 'modo_coleta_')
     for key in list(st.session_state.keys()):
         if key.startswith(prefixos_para_limpar):
             del st.session_state[key]
@@ -1305,9 +1305,19 @@ if condicao_passo5:
                 # carregado, o zoom fica 100% em controle dele, sem "voltar"
                 # sozinho. A vista só é recalculada quando o PYTHON tem um motivo
                 # explícito pra isso: o ponto mudou, ou o usuário clicou em
-                # "Atualizar Vista"/"Vista Geral".
-                ZOOM_PADRAO_MAPA = 19    # visão inicial ao chegar num ponto
-                ZOOM_DETALHE_MAPA = 22   # visão nítida buscada pelo botão "Atualizar Vista"
+                # "Vista Geral".
+                #
+                # O recorte ao chegar num ponto busca DIRETO a área em detalhe
+                # (zoom alto, pouca decimação). Um recorte inicial mais aberto
+                # (zoom baixo) precisava reduzir demais a resolução nativa da
+                # ortofoto (ex: 2cm de GSD) para caber no limite de pixels da
+                # imagem exibida — essa decimação pesada com reamostragem
+                # bilinear causa aliasing em alvos pequenos e de alto contraste,
+                # fazendo-os parecer "deslocados" da coordenada real mesmo
+                # estando no lugar certo. Buscar direto o recorte em detalhe evita
+                # esse efeito, então o botão "Atualizar Vista" (que só fazia essa
+                # troca sob demanda) deixou de ser necessário e foi comentado.
+                ZOOM_DETALHE_MAPA = 22   # visão nítida usada sempre que o ponto muda
 
                 imagem_cache = st.session_state.get(chave_imagem_recortada)
                 ponto_mudou = (
@@ -1317,40 +1327,37 @@ if condicao_passo5:
                 )
                 nivel_atual = "ponto" if ponto_mudou else imagem_cache.get("nivel", "ponto")
 
-                col_btn_atualizar, col_btn_geral = st.columns(2)
-                with col_btn_atualizar:
-                    atualizar_vista_clicado = st.button(
-                        "🔄 Atualizar Vista",
-                        use_container_width=True,
-                        help="Busca um recorte bem mais nítido e aproximado ao redor do ponto atual — use quando a imagem ficar borrada de tanto dar zoom."
-                    )
-                with col_btn_geral:
-                    vista_geral_clicado = st.button(
-                        "🌍 Vista Geral",
-                        use_container_width=True,
-                        help="Mostra a ortofoto inteira, para você se localizar."
-                    )
+                vista_geral_clicado = st.button(
+                    "🌍 Vista Geral",
+                    use_container_width=True,
+                    help="Mostra a ortofoto inteira, para você se localizar."
+                )
+                # Botão "🔄 Atualizar Vista" removido por ora: a vista em detalhe já
+                # é buscada automaticamente sempre que o ponto muda (ver
+                # ZOOM_DETALHE_MAPA acima), então o botão não trazia ganho real de
+                # precisão. Deixado comentado para reativar facilmente se precisar
+                # (ex: recortes com pirâmides/overviews de imagens muito grandes).
+                # atualizar_vista_clicado = st.button(
+                #     "🔄 Atualizar Vista",
+                #     use_container_width=True,
+                #     help="Busca um recorte bem mais nítido e aproximado ao redor do ponto atual — use quando a imagem ficar borrada de tanto dar zoom."
+                # )
 
                 if vista_geral_clicado:
                     nivel_atual = "geral"
-                elif atualizar_vista_clicado:
-                    nivel_atual = "detalhe"
 
                 # A imagem recortada só é regerada quando há um motivo explícito:
-                # o ponto mudou, ou um dos dois botões foi clicado — nunca sozinha
-                # por causa de pan/zoom, para manter previsível o custo de
+                # o ponto mudou, ou "Vista Geral" foi clicado — nunca sozinha por
+                # causa de pan/zoom, para manter previsível o custo de
                 # processamento em rasters de vários GB.
-                if ponto_mudou or atualizar_vista_clicado or vista_geral_clicado:
+                if ponto_mudou or vista_geral_clicado:
                     with st.spinner("Recortando a ortofoto..."):
                         try:
                             if nivel_atual == "geral":
                                 bounds_recorte = extensao_raster
                                 max_dim_recorte = 1200
-                            elif nivel_atual == "detalhe":
-                                bounds_recorte = calcula_bounds_por_zoom(lat_centro, lon_centro, ZOOM_DETALHE_MAPA)
-                                max_dim_recorte = 1800
                             else:
-                                bounds_recorte = calcula_bounds_por_zoom(lat_centro, lon_centro, ZOOM_PADRAO_MAPA)
+                                bounds_recorte = calcula_bounds_por_zoom(lat_centro, lon_centro, ZOOM_DETALHE_MAPA)
                                 max_dim_recorte = 1800
                             imagem_uri, bounds_img = gera_overlay_ortofoto(caminho_raster, bounds_recorte, max_dim=max_dim_recorte)
                             imagem_cache = {
@@ -1366,7 +1373,7 @@ if condicao_passo5:
 
                 mapa = folium.Map(
                     location=[lat_centro, lon_centro],
-                    zoom_start=ZOOM_PADRAO_MAPA,
+                    zoom_start=ZOOM_DETALHE_MAPA,
                     max_zoom=23,
                     tiles=None,
                     control_scale=True
