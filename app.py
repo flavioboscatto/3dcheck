@@ -523,7 +523,7 @@ def limpar_tudo():
                 pass
 
     st.session_state.reset_key += 1
-    prefixos_para_limpar = ('cache_', 'raster_path_', 'raster_id_', 'raster_mde_path_', 'raster_mde_id_', 'imagem_recortada_', 'extensao_raster_', 'epsg_raster_', 'marcacoes_', 'select_ponto_', 'pendente_nav_', 'ultimo_clique_', 'modo_coleta_')
+    prefixos_para_limpar = ('cache_', 'raster_path_', 'raster_id_', 'raster_mde_path_', 'raster_mde_id_', 'imagem_recortada_', 'extensao_raster_', 'epsg_raster_', 'marcacoes_', 'select_ponto_', 'pendente_nav_', 'ultimo_clique_', 'modo_coleta_', 'nivel_manual_')
     for key in list(st.session_state.keys()):
         if key.startswith(prefixos_para_limpar):
             del st.session_state[key]
@@ -1310,11 +1310,44 @@ if condicao_passo5:
                 # (com cursor em cruz, de alta precisão); fora dele o mapa serve só
                 # para navegar/dar zoom sem risco de marcar sem querer.
                 chave_modo_coleta = f"modo_coleta_{st.session_state.reset_key}"
+                # "Espiada" manual na vista geral (botão abaixo) SEM sair do
+                # modo de coleta — diferente do nível "geral" que já acontece
+                # sozinho quando a coleta está desligada.
+                chave_nivel_manual = f"nivel_manual_{st.session_state.reset_key}"
                 modo_coleta = st.session_state.get(chave_modo_coleta, False)
-                rotulo_coleta = "⏹️ Encerrar Coleta" if modo_coleta else "🎯 Coletar Ponto"
-                if st.button(rotulo_coleta, type="primary" if modo_coleta else "secondary", use_container_width=True):
-                    st.session_state[chave_modo_coleta] = not modo_coleta
+
+                espiando_geral = bool(st.session_state.get(chave_nivel_manual))
+
+                col_coleta, col_geral = st.columns(2)
+                with col_coleta:
+                    rotulo_coleta = "⏹️ Encerrar Coleta" if modo_coleta else "🎯 Coletar Ponto"
+                    coleta_clicado = st.button(rotulo_coleta, type="primary" if modo_coleta else "secondary", use_container_width=True)
+                with col_geral:
+                    # Toggle: mesmo botão liga/desliga a espiada na vista geral,
+                    # sem precisar navegar pra outro ponto para "sair" dela.
+                    rotulo_geral = "🔎 Voltar ao Detalhe" if espiando_geral else "🌍 Vista Geral"
+                    vista_geral_clicado = st.button(
+                        rotulo_geral,
+                        use_container_width=True,
+                        disabled=not modo_coleta,
+                        help="Mostra a ortofoto inteira (baixa resolução) sem sair do modo de coleta."
+                    )
+
+                if coleta_clicado:
+                    ligando_coleta = not modo_coleta
+                    modo_coleta = ligando_coleta
+                    st.session_state[chave_modo_coleta] = modo_coleta
+                    st.session_state.pop(chave_nivel_manual, None)
+                    if ligando_coleta:
+                        # Retoma no primeiro ponto ainda sem marcação (fica no
+                        # ponto atual se já estiver tudo marcado).
+                        primeiro_pendente = next((pid for pid in lista_ids if pid not in marcacoes), None)
+                        if primeiro_pendente is not None:
+                            st.session_state[chave_pendente_nav] = primeiro_pendente
                     st.rerun()
+
+                if vista_geral_clicado:
+                    st.session_state[chave_nivel_manual] = not espiando_geral
 
                 # Centro do mapa: coordenada já marcada (se houver) ou nominal do
                 # GCP do ponto atual — a navegação Anterior/Próximo/avanço
@@ -1337,41 +1370,43 @@ if condicao_passo5:
                 # que dar zoom com o mouse nunca dispare um rerun/remonte do mapa
                 # por conta própria: enquanto o usuário só navega no mapa já
                 # carregado, o zoom fica 100% em controle dele, sem "voltar"
-                # sozinho. A vista só é recalculada quando o ponto muda ou o
-                # usuário clica em "Vista Geral".
+                # sozinho. A vista só é recalculada quando o ponto, o nível ou
+                # a espiada na vista geral mudam.
                 ZOOM_DETALHE_MAPA = 20   # zoom inicial do recorte de detalhe
 
                 imagem_cache = st.session_state.get(chave_imagem_recortada)
-                # Raster "novo" (primeira vez que essa ortofoto é exibida
-                # nesta sessão — inclui importar um projeto JSON já com
-                # pontos) abre em Vista Geral, para o usuário se localizar
-                # antes de ir para o detalhe de cada ponto. Trocar de ponto
-                # (Anterior/Próximo/seleção) continua indo direto pro detalhe.
-                raster_novo = (
+
+                # Sempre que o PONTO exibido muda — navegação manual, avanço
+                # automático ao marcar, ou o pulo pro primeiro pendente ao
+                # ligar a coleta — qualquer espiada na vista geral pedida
+                # antes deixa de valer: a próxima vista volta a ser o
+                # detalhe do novo ponto.
+                if imagem_cache is not None and imagem_cache.get("ponto") != ponto_escolhido:
+                    st.session_state.pop(chave_nivel_manual, None)
+
+                # O nível de zoom é decidido pelo estado da coleta: desligada
+                # = sempre a ortofoto inteira (nunca "zoom extents" durante a
+                # navegação/coleta em si); ligada = sempre o recorte de
+                # detalhe do ponto atual, exceto durante uma espiada manual
+                # na vista geral (que não desliga a coleta).
+                if not modo_coleta:
+                    nivel_atual = "geral"
+                elif st.session_state.get(chave_nivel_manual):
+                    nivel_atual = "geral"
+                else:
+                    nivel_atual = "ponto"
+
+                # A imagem só é regerada quando algo relevante mudou — raster,
+                # ponto ou nível — nunca sozinha por causa de pan/zoom do
+                # mouse, para manter previsível o custo de processamento em
+                # rasters de vários GB.
+                precisa_regerar = (
                     imagem_cache is None
                     or imagem_cache.get("raster_id") != identificador_raster
+                    or imagem_cache.get("ponto") != ponto_escolhido
+                    or imagem_cache.get("nivel") != nivel_atual
                 )
-                ponto_mudou = raster_novo or imagem_cache.get("ponto") != ponto_escolhido
-                if raster_novo:
-                    nivel_atual = "geral"
-                elif ponto_mudou:
-                    nivel_atual = "ponto"
-                else:
-                    nivel_atual = imagem_cache.get("nivel", "ponto")
-
-                vista_geral_clicado = st.button(
-                    "🌍 Vista Geral",
-                    use_container_width=True,
-                    help="Mostra a ortofoto inteira (em baixa resolução), para você se localizar."
-                )
-                if vista_geral_clicado:
-                    nivel_atual = "geral"
-
-                # A imagem recortada só é regerada quando há um motivo
-                # explícito: o ponto mudou, ou "Vista Geral" foi clicado —
-                # nunca sozinha por causa de pan/zoom, para manter previsível
-                # o custo de processamento em rasters de vários GB.
-                if ponto_mudou or vista_geral_clicado:
+                if precisa_regerar:
                     with st.spinner("Recortando a ortofoto..."):
                         try:
                             if nivel_atual == "geral":
@@ -1414,7 +1449,7 @@ if condicao_passo5:
                 # Fora do modo de coleta, cursor de "mãozinha" padrão do Leaflet
                 # (deixa claro que o mapa só está sendo navegado). Durante a coleta,
                 # cursor em cruz para marcar o ponto com o máximo de precisão.
-                cursor_mapa = "crosshair" if modo_coleta else "grab"
+                cursor_mapa = "crosshair" if (modo_coleta and nivel_atual == "ponto") else "grab"
                 mapa.get_root().html.add_child(folium.Element(
                     "<style>.leaflet-container, .leaflet-grab, .leaflet-dragging .leaflet-grab, "
                     f".leaflet-interactive {{ cursor: {cursor_mapa} !important; }}</style>"
@@ -1452,7 +1487,9 @@ if condicao_passo5:
                 if mostrar_marcador_nominal:
                     partes_legenda.append("marcador azul = coordenada nominal do GCP")
                 partes_legenda.append("marcador vermelho = posição já marcada")
-                if modo_coleta:
+                if modo_coleta and nivel_atual != "ponto":
+                    st.info(f"🌍 Espiando a vista geral — clique em **🔎 Voltar ao Detalhe** para voltar ao recorte de **{ponto_escolhido}** ({'; '.join(partes_legenda)}).")
+                elif modo_coleta:
                     st.info(f"🎯 Modo coleta ativo: clique com precisão sobre a feição correspondente ao ponto **{ponto_escolhido}** ({'; '.join(partes_legenda)}).")
                 else:
                     st.caption(f"Navegue/dê zoom à vontade sem risco de marcar sem querer. Clique em **🎯 Coletar Ponto** quando estiver pronto para marcar **{ponto_escolhido}** ({'; '.join(partes_legenda)}).")
@@ -1486,7 +1523,10 @@ if condicao_passo5:
                     clique_e_novo = st.session_state.get(chave_ultimo_clique) != identificador_clique
                     st.session_state[chave_ultimo_clique] = identificador_clique
 
-                    if clique_e_novo and modo_coleta:
+                    # Só marca se estiver de fato no recorte de detalhe — um
+                    # clique durante uma "espiada" na vista geral (baixa
+                    # resolução, pouca precisão) nunca deve virar marcação.
+                    if clique_e_novo and modo_coleta and nivel_atual == "ponto":
                         x_marcado, y_marcado = transformer_de_wgs84.transform(lon_clique, lat_clique)
                         marcacoes[ponto_escolhido] = {"x": x_marcado, "y": y_marcado}
                         st.session_state[chave_marcacoes] = marcacoes
